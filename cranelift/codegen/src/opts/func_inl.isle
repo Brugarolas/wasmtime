@@ -1,0 +1,160 @@
+;; `function_inlining.isle` - Optimizations for function inlining.
+
+;; Inline Small Functions
+;; -----------------------
+
+;; Inline a small function if it consists of a single return statement.
+(rule (simplify (call ty fn args))
+      (if-let true (is_small_function fn))
+      (inline_function fn args))
+
+;; Inline small pure functions that have no side effects.
+(rule (simplify (call ty fn args))
+      (if-let true (is_pure_function fn))
+      (if-let true (is_small_function fn))
+      (inline_function fn args))
+
+;; Inline accessor functions that just return a field.
+(rule (simplify (call ty fn args))
+      (if-let true (is_accessor_function fn))
+      (inline_accessor fn args))
+
+;; Inline small functions used in tight loops.
+(rule (simplify (loop_body (call ty fn args)))
+      (if-let true (is_small_function fn))
+      (inline_function fn args))
+
+;; Constant Folding for Inlined Functions
+;; ---------------------------------------
+
+;; If all arguments are constants, inline and evaluate the function at compile time.
+(rule (simplify (call ty fn args @ (all_constants args)))
+      (if-let constant_result (evaluate_function_constant fn args))
+      (subsume (iconst ty constant_result)))
+
+;; Inline Functions with Fixed Known Returns
+;; ------------------------------------------
+
+;; Inline a function if it always returns a fixed value.
+(rule (simplify (call ty fn _))
+      (if-let true (has_fixed_return_value fn))
+      (subsume (fixed_return_value fn)))
+
+;; Inline a function that returns one of its arguments directly.
+(rule (simplify (call ty fn args))
+      (if-let true (is_direct_return_function fn))
+      (subsume (direct_return_argument fn args)))
+
+;; Tail Call Optimization
+;; -----------------------
+
+;; Convert a direct recursive tail call into a loop.
+(rule (simplify (tail_call ty fn args))
+      (if-let true (is_tail_recursive fn))
+      (convert_to_loop fn args))
+
+;; Remove an indirect recursive tail call if its recursion depth is constant.
+(rule (simplify (tail_call ty fn args))
+      (if-let depth (constant_recursion_depth fn))
+      (unroll_recursion fn args depth))
+
+;; Inline Special Patterns
+;; ------------------------
+
+;; Inline trivial wrapper functions that just forward arguments.
+(rule (simplify (call ty wrapper_fn args))
+      (if-let target_fn (is_wrapper_function wrapper_fn))
+      (call ty target_fn args))
+
+;; Inline small functions used in conditional branches.
+(rule (simplify (select ty cond (call _ fn1 args1) (call _ fn2 args2)))
+      (if-let true (is_small_function fn1))
+      (if-let true (is_small_function fn2))
+      (select ty cond (inline_function fn1 args1) (inline_function fn2 args2)))
+
+;; Inline Virtual Calls
+;; ---------------------
+
+;; Inline a virtual function call if the exact implementation is known.
+(rule (simplify (call_virtual ty fn args))
+      (if-let concrete_fn (resolve_virtual_function fn))
+      (call ty concrete_fn args))
+
+;; Optimize polymorphic virtual calls into direct calls for a single known implementation.
+(rule (simplify (call_virtual ty fn args))
+      (if-let true (has_single_implementation fn))
+      (call ty (single_implementation fn) args))
+
+;; Function Splitting
+;; ------------------
+
+;; Split a large function into smaller inlined blocks to improve instruction cache locality.
+(rule (simplify (large_function_call ty fn args))
+      (if-let split_functions (split_large_function fn))
+      (inline_function_sequence split_functions args))
+
+;; Hot Path Optimization
+;; ----------------------
+
+;; Inline functions that are frequently used in performance-critical paths.
+(rule (simplify (call ty fn args))
+      (if-let true (is_hot_function fn))
+      (inline_function fn args))
+
+;; Inline small functions called in loop headers for reduced call overhead.
+(rule (simplify (loop_header (call ty fn args)))
+      (if-let true (is_small_function fn))
+      (inline_function fn args))
+
+;; Inline Math Operations
+;; -----------------------
+
+;; Inline small math utility functions (e.g., `min`, `max`, `abs`).
+(rule (simplify (call ty fn args))
+      (if-let true (is_small_math_function fn))
+      (inline_function fn args))
+
+;; Inline one-line arithmetic functions.
+(rule (simplify (call ty fn args))
+      (if-let true (is_one_line_arithmetic fn))
+      (inline_function fn args))
+
+;; Inline String Operations
+;; -------------------------
+
+;; Inline small string utility functions (e.g., `strlen`, `strcpy`).
+(rule (simplify (call ty fn args))
+      (if-let true (is_small_string_function fn))
+      (inline_function fn args))
+
+;; Inline pure string comparison functions.
+(rule (simplify (call ty fn args))
+      (if-let true (is_pure_function fn))
+      (if-let true (is_small_string_function fn))
+      (inline_function fn args))
+
+;; Recursive Inlining
+;; -------------------
+
+;; Inline recursive functions with a constant recursion depth.
+(rule (simplify (call ty fn args))
+      (if-let depth (constant_recursion_depth fn))
+      (unroll_recursion fn args depth))
+
+;; Inline mutually recursive functions when their recursion depth is bounded.
+(rule (simplify (call ty fn args))
+      (if-let true (is_mutual_recursion fn))
+      (if-let depth (bounded_recursion_depth fn))
+      (unroll_mutual_recursion fn args depth))
+
+;; Miscellaneous
+;; -------------
+
+;; Inline immediately-invoked lambdas.
+(rule (simplify (call ty (lambda args body) args))
+      (inline_lambda body args))
+
+;; Remove dead function calls when their result is unused.
+(rule (simplify (call ty fn args))
+      (if-let false (is_used fn))
+      (subsume nop))

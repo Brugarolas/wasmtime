@@ -1,0 +1,85 @@
+;; Dead Code Elimination (DCE) Optimizations
+;; Designed to run first, removing redundant or unused instructions.
+
+;; Remove redundant operations producing unused values.
+(rule (eliminate (iadd _ (iconst _ 0) x)) x)
+(rule (eliminate (iadd _ x (iconst _ 0))) x)
+(rule (eliminate (isub _ x (iconst _ 0))) x)
+(rule (eliminate (imul _ x (iconst _ 1))) x)
+(rule (eliminate (imul _ (iconst _ 1) x))) x)
+(rule (eliminate (imul _ x (iconst _ 0))) (iconst _ 0))
+(rule (eliminate (imul _ (iconst _ 0) x)) (iconst _ 0))
+(rule (eliminate (ineg _ (ineg _ x))) x)
+
+;; Remove unused comparisons.
+(rule (eliminate (icmp _ cc x x)) 
+      (if-let true (intcc_simplifies_to_trivial cc))
+      (iconst _ trivial_result))
+(rule (eliminate (icmp _ cc x (iconst _ c))) 
+      (if-let true (constant_cmp_simplifies cc c x))
+      (iconst _ simplified_result))
+
+;; Remove unused select statements.
+(rule (eliminate (select ty cond x x)) x)
+(rule (eliminate (select ty (iconst _ 1) x y)) x)
+(rule (eliminate (select ty (iconst _ 0) x y)) y)
+
+;; Simplify conditional branches with known conditions.
+(rule (eliminate (brif cond then_label else_label))
+      (if-let true (known_condition cond))
+      (branch_to_known_label cond then_label else_label))
+
+;; Remove redundant vector operations.
+(rule (eliminate (vreduce ty (vload ty addr)))
+      (if-let true (is_redundant_vector_load addr))
+      (iconst _ precomputed_result))
+
+;; Eliminate redundant moves or copies.
+(rule (eliminate (move x x)) x)
+
+;; Remove unnecessary extensions or reductions.
+(rule (eliminate (uextend _ (ireduce _ x))) x)
+(rule (eliminate (ireduce _ (uextend _ x))) x)
+(rule (eliminate (sextend _ (ireduce _ x))) x)
+(rule (eliminate (ireduce _ (sextend _ x))) x)
+
+;; Remove unused constant definitions.
+(rule (eliminate (iconst _ _)) (if-let false (is_used_in_code _)))
+
+;; Simplify no-op shuffles.
+(rule (eliminate (vshuffle _ x _)) x)
+
+;; Remove operations whose results are unused in the program.
+(rule (eliminate op) (if-let false (is_used op)))
+
+;; Dead block elimination: remove code from blocks with no paths leading to them.
+(decl dead_block_elimination (Block) ())
+(rule (dead_block_elimination block)
+      (if-let true (block_is_unreachable block))
+      (remove_block block))
+
+;; Specific arithmetic identities.
+(rule (eliminate (bor _ x (iconst _ 0))) x)
+(rule (eliminate (band _ x (iconst _ -1))) x)
+(rule (eliminate (bxor _ x (iconst _ 0))) x)
+
+;; Simplify redundant loads.
+(rule (eliminate (vload ty addr))
+      (if-let true (is_previously_loaded addr))
+      (previously_loaded_value addr))
+
+;; Remove dead store instructions.
+(rule (eliminate (vstore ty addr value))
+      (if-let false (store_has_effect addr value)))
+
+;; Remove unused branches.
+(rule (eliminate (br _)) (if-let false (branch_is_executed _)))
+
+;; Remove redundant splats.
+(rule (eliminate (splat ty (iconst _ x))) (if-let false (is_used_in_vector _)))
+
+;; Eliminate unnecessary returns of constant values.
+(rule (eliminate (return (iconst _ _))) (return_none))
+
+;; Remove unused side-effect-free computations.
+(rule (eliminate (computation)) (if-let false (has_side_effect computation)))

@@ -87,3 +87,228 @@
 
 (rule (simplify (uwiden_high wide (splat _ x))) (splat wide (uextend (lane_type wide) x)))
 (rule (simplify (uwiden_low wide (splat _ x))) (splat wide (uextend (lane_type wide) x)))
+
+;; Vectorization optimizations to enable better use of SIMD instructions.
+
+;; Fuse independent scalar operations into vector operations when possible.
+
+;; Add vector operations for addition, subtraction, and multiplication
+(rule (simplify (splat ty (iadd scalar_ty x y)))
+      (splat ty (iadd scalar_ty x y)))
+(rule (simplify (splat ty (isub scalar_ty x y)))
+      (splat ty (isub scalar_ty x y)))
+(rule (simplify (splat ty (imul scalar_ty x y)))
+      (splat ty (imul scalar_ty x y)))
+
+;; Optimize reductions from vector to scalar
+(rule (simplify (vredadd ty (splat _ x)))
+      (vredadd ty x))
+(rule (simplify (vredmul ty (splat _ x)))
+      (vredmul ty x))
+
+;; Apply fused multiply-add (FMA) where supported
+(rule (simplify (vadd ty (vmul ty x y) z))
+      (vfma ty x y z))
+
+;; Exploit horizontal operations for reductions
+(rule (simplify (vadd (ty_vec ty) (splat _ x) (splat _ y)))
+      (splat ty (iadd (lane_type ty) x y)))
+(rule (simplify (vsub (ty_vec ty) (splat _ x) (splat _ y)))
+      (splat ty (isub (lane_type ty) x y)))
+(rule (simplify (vmul (ty_vec ty) (splat _ x) (splat _ y)))
+      (splat ty (imul (lane_type ty) x y)))
+
+;; Simplify vector compares into mask operations
+(rule (simplify (splat ty (icmp cc (lane_type ty) x y)))
+      (vcmplt ty cc x y))
+
+;; Vector shift optimizations
+(rule (simplify (ishl ty (splat ty x) (splat _ y)))
+      (vshl ty x y))
+(rule (simplify (ushr ty (splat ty x) (splat _ y)))
+      (vshr ty x y))
+(rule (simplify (sshr ty (splat ty x) (splat _ y)))
+      (vshr ty x y))
+
+;; Simplify logical operations for vectors
+(rule (simplify (band ty (splat ty x) (splat ty y)))
+      (splat ty (band (lane_type ty) x y)))
+(rule (simplify (bor ty (splat ty x) (splat ty y)))
+      (splat ty (bor (lane_type ty) x y)))
+(rule (simplify (bxor ty (splat ty x) (splat ty y)))
+      (splat ty (bxor (lane_type ty) x y)))
+
+;; Horizontal min/max
+(rule (simplify (vredmin ty (splat _ x)))
+      (splat ty (smin (lane_type ty) x x)))
+(rule (simplify (vredmax ty (splat _ x)))
+      (splat ty (smax (lane_type ty) x x)))
+
+;; Vectorized conditional selection
+(rule (simplify (select (ty_vec ty) (vcmplt ty cc x y) z w))
+      (vselect ty cc x y z w))
+
+;; Enable masked loads/stores for conditional vector operations
+(rule (simplify (vload ty (ifelse mask addr)))
+      (vload_masked ty addr mask))
+(rule (simplify (vstore ty (ifelse mask addr value)))
+      (vstore_masked ty addr value mask))
+
+;; Expand scalar operations to vectors when applicable
+(rule (simplify (vadd ty (splat ty x) y))
+      (vadd ty (splat ty x) y))
+(rule (simplify (vsub ty (splat ty x) y))
+      (vsub ty (splat ty x) y))
+(rule (simplify (vmul ty (splat ty x) y))
+      (vmul ty (splat ty x) y))
+
+;; Combine multiple splats into a single operation
+(rule (simplify (vadd ty (splat ty x) (splat ty y)))
+      (splat ty (iadd (lane_type ty) x y)))
+(rule (simplify (vsub ty (splat ty x) (splat ty y)))
+      (splat ty (isub (lane_type ty) x y)))
+
+;; Optimize vectorized absolute values
+(rule (simplify (splat ty (iabs (lane_type ty) x)))
+      (vabs ty x))
+
+;; Remove redundant splat operations
+(rule (simplify (splat ty (splat _ x)))
+      (splat ty x))
+
+;; Simplify masked reduction into a single operation
+(rule (simplify (vreduce ty (vadd ty (mask _ _) x y)))
+      (vadd_masked ty x y))
+
+;; Remove unnecessary broadcasts
+(rule (simplify (vload ty (splat _ addr)))
+      (splat ty (vload (lane_type ty) addr)))
+(rule (simplify (vstore ty (splat _ addr value)))
+      (vstore ty addr (splat (lane_type ty) value)))
+
+;; Vectorized divide simplifications
+(rule (simplify (vdiv ty (splat ty x) (splat ty y)))
+      (splat ty (idiv (lane_type ty) x y)))
+
+;; Optimize vectorized modulus operations
+(rule (simplify (vmod ty (splat ty x) (splat ty y)))
+      (splat ty (imod (lane_type ty) x y)))
+
+;; Vectorized popcount optimizations
+(rule (simplify (popcnt ty (splat ty x)))
+      (splat ty (popcnt (lane_type ty) x)))
+
+;; Simplify vector comparisons into boolean masks
+(rule (simplify (splat ty (icmp cc (lane_type ty) x y)))
+      (vcmplt ty cc x y))
+
+;; Combine multiple vector constants
+(rule (simplify (vconst ty (vadd ty c1 c2)))
+      (vadd ty c1 c2))
+(rule (simplify (vconst ty (vmul ty c1 c2)))
+      (vmul ty c1 c2))
+
+;; Extended Vectorization Optimizations with Advanced Instruction Set Support
+
+;; **Additional Vector Optimizations**
+
+;; Vectorized blending with conditional selects
+(rule (simplify (select ty (vcmplt ty cc x y) z w))
+      (vblend ty x z w))
+
+;; Optimized horizontal additions for reductions
+(rule (simplify (vreduce ty (vadd ty x y)))
+      (vreduceadd ty x y))
+(rule (simplify (vreduce ty (vsub ty x y)))
+      (vreducesub ty x y))
+
+;; Support for vectorized dot products
+(rule (simplify (vreduce ty (vmul ty x y)))
+      (vdot ty x y))
+
+;; Optimized packing/unpacking for interleaved data
+(rule (simplify (vpack ty x y))
+      (vzip ty x y))
+(rule (simplify (vunpack ty x y))
+      (vunzip ty x y))
+
+;; Optimization for horizontal shuffles (e.g., combining lanes)
+(rule (simplify (vshuffle ty (vadd ty x y) mask))
+      (vshuffleadd ty x y mask))
+(rule (simplify (vshuffle ty (vmul ty x y) mask))
+      (vshufflemul ty x y mask))
+
+;; **Support for Advanced Instruction Sets**
+
+;; Bit manipulation instructions
+(rule (simplify (vand ty (splat ty x) (splat ty y)))
+      (vbitand ty x y))
+(rule (simplify (vor ty (splat ty x) (splat ty y)))
+      (vbitor ty x y))
+(rule (simplify (vxor ty (splat ty x) (splat ty y)))
+      (vbitxor ty x y))
+(rule (simplify (vnot ty (splat ty x)))
+      (vbitnot ty x))
+
+;; Advanced AES optimizations
+;; Use AESENC (AES Encryption Round) to optimize operations where relevant
+(rule (simplify (vaesenc ty (splat ty x) (splat ty y)))
+      (vaesopt ty x y))
+
+;; Matrix SIMD optimizations (matrix multiplication, dot products)
+(rule (simplify (vdot ty (vload ty addr1) (vload ty addr2)))
+      (vmatmul ty addr1 addr2))
+(rule (simplify (vmul ty (vmatmul ty m1 m2) v))
+      (vmatvecmul ty m1 m2 v))
+
+;; Support for vectorized CRC or checksum-like optimizations
+(rule (simplify (vcrc ty (splat ty x) (splat ty y)))
+      (vcrcopt ty x y))
+
+;; **Optimization of SIMD Instructions**
+
+;; Simplify redundant SIMD instructions
+(rule (simplify (vadd ty (vadd ty x y) z))
+      (vadd ty x (vadd ty y z)))
+(rule (simplify (vmul ty (vmul ty x y) z))
+      (vmul ty x (vmul ty y z)))
+
+;; Combine adjacent shifts
+(rule (simplify (vshl ty (vshl ty x k1) k2))
+      (vshl ty x (iadd k1 k2)))
+(rule (simplify (vshr ty (vshr ty x k1) k2))
+      (vshr ty x (iadd k1 k2)))
+
+;; Combine adjacent rotations
+(rule (simplify (vrotl ty (vrotl ty x k1) k2))
+      (vrotl ty x (iadd k1 k2)))
+(rule (simplify (vrotr ty (vrotr ty x k1) k2))
+      (vrotr ty x (iadd k1 k2)))
+
+;; Normalize shift and rotate amounts
+(rule (simplify (vshl ty x (iconst ty k)))
+      (if-let true (u64_eq k (u64_and k (ty_shift_mask ty))))
+      (vshl ty x k))
+(rule (simplify (vrotl ty x (iconst ty k)))
+      (if-let true (u64_eq k (u64_and k (ty_shift_mask ty))))
+      (vrotl ty x k))
+
+;; Optimize fused multiply-add (FMA) across lanes
+(rule (simplify (vadd ty (vmul ty x y) z))
+      (vfma ty x y z))
+
+;; Remove redundant splat and broadcast
+(rule (simplify (splat ty (splat _ x)))
+      (splat ty x))
+(rule (simplify (vload ty (splat _ addr)))
+      (splat ty (vload (lane_type ty) addr)))
+
+;; Optimize vector conditional masks
+(rule (simplify (vselect ty (vcmplt ty cc x y) z w))
+      (vmaskselect ty cc x y z w))
+
+;; Simplify reductions on precomputed constants
+(rule (simplify (vreduceadd ty (vload ty (iconst ty addr))))
+      (vreduceadd_pre ty addr))
+(rule (simplify (vreducesub ty (vload ty (iconst ty addr))))
+      (vreducesub_pre ty addr))

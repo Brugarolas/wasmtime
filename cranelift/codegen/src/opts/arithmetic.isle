@@ -238,3 +238,123 @@
       (fcvt_from_uint ty val))
 (rule (simplify (fcvt_from_sint ty (sextend _ val)))
       (fcvt_from_sint ty val))
+
+;; Multiply-Add Combination:
+;; x * 2 + y == x << 1 + y
+(rule (simplify (iadd ty (imul ty x (iconst_u _ 2)) y))
+      (iadd ty (ishl ty x (iconst ty 1)) y))
+
+;; Combine multiplication and addition into a fused multiply-add (FMA) instruction:
+;; x * y + z == fma(x, y, z)
+(rule (simplify (iadd ty (imul ty x y) z))
+      (fma ty x y z))
+
+;; x * c == x << log2(c) when c is a power of two, rewritten for addition:
+;; x * c + y == (x << log2(c)) + y
+(rule (simplify (iadd ty (imul ty x (iconst _ (imm64_power_of_two c))) y))
+      (iadd ty (ishl ty x (iconst ty (imm64 c))) y))
+
+;; Strength Reduction for Division:
+;; x / c == x >> log2(c) when c is a power of two
+(rule (simplify (sdiv ty x (iconst _ (imm64_power_of_two c))))
+      (sshr ty x (iconst ty (imm64 c))))
+
+;; x % c == x & (c - 1) when c is a power of two
+(rule (simplify (srem ty x (iconst _ (imm64_power_of_two c))))
+      (band ty x (iconst ty (imm64_minus_one c))))
+
+;; Distributive Property:
+;; x * (y + z) == x * y + x * z
+(rule (simplify (imul ty x (iadd ty y z)))
+      (iadd ty (imul ty x y) (imul ty x z)))
+
+;; Combine Negation and Multiplication:
+;; -x * y == -(x * y)
+(rule (simplify (imul ty (ineg ty x) y))
+      (ineg ty (imul ty x y)))
+
+;; Constant Folding:
+;; Precompute constant additions, subtractions, multiplications, and divisions.
+(rule (simplify (iadd ty (iconst_u ty a) (iconst_u ty b)))
+      (iconst_u ty (u64_add a b)))
+(rule (simplify (isub ty (iconst_u ty a) (iconst_u ty b)))
+      (iconst_u ty (u64_sub a b)))
+(rule (simplify (imul ty (iconst_u ty a) (iconst_u ty b)))
+      (iconst_u ty (u64_mul a b)))
+(rule (simplify (sdiv ty (iconst_u ty a) (iconst_u ty b)))
+      (iconst_u ty (u64_div a b)))
+
+;; Combining Bitwise and Arithmetic:
+;; (~x) + 1 == -x
+(rule (simplify (iadd ty (bnot ty x) (iconst_u ty 1)))
+      (ineg ty x))
+
+;; Logical Strength Reduction:
+;; x && x == x
+(rule (simplify (band ty x x))
+      (subsume x))
+
+;; x || x == x
+(rule (simplify (bor ty x x))
+      (subsume x))
+
+;; Associative Rules for Bitwise AND and OR:
+;; x & (y & z) == (x & y) & z
+(rule (simplify (band ty x (band ty y z)))
+      (band ty (band ty x y) z))
+(rule (simplify (bor ty x (bor ty y z)))
+      (bor ty (bor ty x y) z))
+
+;; Floating Point: Zero Propagation:
+;; x * 0.0 == 0.0
+(rule (simplify (fmul ty x (fconst ty 0.0)))
+      (fconst ty 0.0))
+(rule (simplify (fmul ty (fconst ty 0.0) x))
+      (fconst ty 0.0))
+
+;; x + 0.0 == x
+(rule (simplify (fadd ty x (fconst ty 0.0)))
+      (subsume x))
+(rule (simplify (fadd ty (fconst ty 0.0) x))
+      (subsume x))
+
+;; x * 1.0 == x
+(rule (simplify (fmul ty x (fconst ty 1.0)))
+      (subsume x))
+(rule (simplify (fmul ty (fconst ty 1.0) x))
+      (subsume x))
+
+;; x - 0.0 == x
+(rule (simplify (fsub ty x (fconst ty 0.0)))
+      (subsume x))
+
+;; Division Optimization:
+;; x / 2.0 == x * 0.5
+(rule (simplify (fdiv ty x (fconst ty 2.0)))
+      (fmul ty x (fconst ty 0.5)))
+
+;; Square and Square Root:
+;; x * x == pow(x, 2.0)
+(rule (simplify (fmul ty x x))
+      (fpow ty x (fconst ty 2.0)))
+
+;; Precompute Floating Point Constants:
+;; x + (y * 2.0) == x + (y << 1)  (if bit-shifting is precise for the type)
+(rule (simplify (fadd ty x (fmul ty y (fconst ty 2.0))))
+      (fadd ty x (fmul ty y (iconst ty 1))))
+
+;; Platform-Specific Optimizations:
+;; Exploiting reciprocal approximation for division:
+;; x / y -> x * (1 / y)
+(rule (simplify (fdiv ty x y))
+      (fmul ty x (reciprocal ty y)))
+
+;; Horizontal Reductions for Vectorized Code:
+;; sum(x1, x2, ..., xn) -> hsum(vector)
+(rule (simplify (reduce_sum ty (build_vector ty [x1, x2, x3, x4])))
+      (hsum ty [x1, x2, x3, x4]))
+
+;; Logical AND Simplification:
+;; x && (x || y) == x
+(rule (simplify (band ty x (bor ty x y)))
+      (subsume x))

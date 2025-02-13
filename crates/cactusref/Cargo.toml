@@ -1,0 +1,44 @@
+[package]
+name = "cactusref"
+version = "0.5.0" # remember to set `html_root_url` in `src/lib.rs`.
+authors = ["Ryan Lopopolo <rjl@hyperbo.la>"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.77.0"
+readme = "README.md"
+repository = "https://github.com/artichoke/cactusref"
+documentation = "https://docs.rs/cactusref"
+homepage = "https://github.com/artichoke/cactusref"
+description = "Cycle-aware reference counting smart pointer"
+keywords = ["garbage-collection", "gc", "pointer", "rc", "tracing"]
+categories = ["data-structures", "memory-management", "no-std"]
+include = ["src/**/*", "tests/**/*", "LICENSE", "README.md"]
+
+[features]
+default = ["std"]
+# Enable a dependency on the Rust standard library. CactusRef uses `std` to
+# optionally implement `std::error::Error` on error types in this crate.
+std = []
+
+[dependencies]
+hashbrown = { version = "0.14.0", default-features = false, features = ["inline-more"] }
+log = "0.4.6"
+rustc-hash = { version = "1.1.0", default-features = false }
+
+[dev-dependencies]
+# Enable debug and trace-level logging in tests.
+env_logger = { version = "0.10.0", default-features = false }
+
+# Check that crate versions are properly updated in documentation and code when
+# bumping the version.
+[dev-dependencies.version-sync]
+version = "0.9.5"
+default-features = false
+features = ["markdown_deps_updated", "html_root_url_updated"]
+
+[package.metadata.docs.rs]
+# This sets the default target to `x86_64-unknown-linux-gnu` and only builds
+# that target. `cactusref` has the same API and code on all targets.
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
+rustdoc-args = ["--cfg", "docsrs"]

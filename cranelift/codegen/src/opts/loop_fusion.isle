@@ -1,0 +1,90 @@
+;; Optimizations for fusing consecutive loops or range-based iterations.
+
+;; Rule: If two loops iterate over the same range and access different
+;; data or perform non-conflicting operations, they can be fused.
+;;
+;; for (i in 0..n) { A[i] = f(i); }
+;; for (i in 0..n) { B[i] = g(i); }
+;; -->
+;; for (i in 0..n) { A[i] = f(i); B[i] = g(i); }
+
+(rule (simplify
+       (for_loop range1
+                 body1 @ (stmt_sequence (assign (array_access arr1 idx) expr1) _))
+       (for_loop range2
+                 body2 @ (stmt_sequence (assign (array_access arr2 idx) expr2) _)))
+      (if-let true (ranges_equal range1 range2))
+      (if-let true (no_data_conflict arr1 arr2))
+      (for_loop range1
+                (stmt_sequence
+                  (assign (array_access arr1 idx) expr1)
+                  (assign (array_access arr2 idx) expr2))))
+
+;; Rule: Fusing simple accumulators when ranges are identical.
+;;
+;; for (i in 0..n) { sum1 += f(i); }
+;; for (i in 0..n) { sum2 += g(i); }
+;; -->
+;; for (i in 0..n) { sum1 += f(i); sum2 += g(i); }
+
+(rule (simplify
+       (for_loop range1
+                 body1 @ (stmt_sequence (assign acc1 (iadd acc1 (call f idx))) _))
+       (for_loop range2
+                 body2 @ (stmt_sequence (assign acc2 (iadd acc2 (call g idx))) _)))
+      (if-let true (ranges_equal range1 range2))
+      (if-let true (no_data_conflict acc1 acc2))
+      (for_loop range1
+                (stmt_sequence
+                  (assign acc1 (iadd acc1 (call f idx)))
+                  (assign acc2 (iadd acc2 (call g idx))))))
+
+;; Rule: Combining multiple `for` loops into a single loop with nested bodies.
+;;
+;; for (i in 0..n) { A[i] = f(i); }
+;; for (j in 0..m) { B[j] = g(j); }
+;; -->
+;; for (i in 0..max(n, m)) {
+;;     if (i < n) { A[i] = f(i); }
+;;     if (i < m) { B[i] = g(i); }
+;; }
+(rule (simplify
+       (for_loop range1
+                 body1 @ (stmt_sequence (assign (array_access arr1 idx) expr1) _))
+       (for_loop range2
+                 body2 @ (stmt_sequence (assign (array_access arr2 idx) expr2) _)))
+      (if-let true (ranges_overlap_or_extendable range1 range2))
+      (fused_loop
+        (max_range range1 range2)
+        (stmt_sequence
+          (if (in_range idx range1)
+              (assign (array_access arr1 idx) expr1))
+          (if (in_range idx range2)
+              (assign (array_access arr2 idx) expr2)))))
+
+;; Helper Functions:
+
+;; Check if two ranges are strictly equal (e.g., both are `0..n`).
+(decl pure ranges_equal (Range Range) bool)
+(rule (ranges_equal (range start1 end1) (range start2 end2))
+      (and (expr_equal start1 start2) (expr_equal end1 end2)))
+
+;; Check if ranges overlap or can be extended for fusion.
+(decl pure ranges_overlap_or_extendable (Range Range) bool)
+(rule (ranges_overlap_or_extendable range1 range2)
+      (or (ranges_equal range1 range2)
+          (ranges_intersect range1 range2)
+          (ranges_can_be_unified range1 range2)))
+
+;; Ensure no data conflict between two variables or arrays.
+(decl pure no_data_conflict (Value Value) bool)
+(rule (no_data_conflict arr1 arr2) (not (alias_or_overlap arr1 arr2)))
+
+;; Find the maximum range of two ranges for fusion.
+(decl pure max_range (Range Range) Range)
+(rule (max_range (range start1 end1) (range start2 end2))
+      (range (min_expr start1 start2) (max_expr end1 end2)))
+
+;; Check if an index is within a specific range.
+(decl pure in_range (Index Range) bool)
+(rule (in_range idx (range start end)) (and (ge idx start) (lt idx end)))

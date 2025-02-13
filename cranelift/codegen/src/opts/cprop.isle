@@ -406,3 +406,135 @@
 (decl ieee128_constant (Ieee128) Constant)
 (extern constructor ieee128_constant ieee128_constant)
 (extern extractor ieee128_constant ieee128_constant_extractor)
+
+;; Integer Arithmetic
+(rule (simplify
+       (iadd (fits_in_64 ty)
+             (iconst ty (u64_from_imm64 k1))
+             (iconst ty (u64_from_imm64 k2))))
+      (subsume (iconst ty (imm64_masked ty (u64_add k1 k2)))))
+
+(rule (simplify
+       (isub (fits_in_64 ty)
+             (iconst ty (u64_from_imm64 k1))
+             (iconst ty (u64_from_imm64 k2))))
+      (subsume (iconst ty (imm64_masked ty (u64_sub k1 k2)))))
+
+(rule (simplify
+       (imul (fits_in_64 ty)
+             (iconst ty (u64_from_imm64 k1))
+             (iconst ty (u64_from_imm64 k2))))
+      (subsume (iconst ty (imm64_masked ty (u64_mul k1 k2)))))
+
+(rule (simplify
+       (sdiv (fits_in_64 ty)
+             (iconst ty (u64_from_imm64 k1))
+             (iconst ty (u64_from_imm64 k2))))
+      (if-let d (u64_sdiv k1 k2))
+      (subsume (iconst ty (imm64_masked ty d))))
+
+(rule (simplify
+       (udiv (fits_in_64 ty)
+             (iconst ty (u64_from_imm64 k1))
+             (iconst ty (u64_from_imm64 k2))))
+      (if-let d (u64_udiv k1 k2))
+      (subsume (iconst ty (imm64_masked ty d))))
+
+;; Bitwise Operations
+(rule (simplify
+       (bor (fits_in_64 ty)
+            (iconst ty (u64_from_imm64 k1))
+            (iconst ty (u64_from_imm64 k2))))
+      (subsume (iconst ty (imm64_masked ty (u64_or k1 k2)))))
+
+(rule (simplify
+       (band (fits_in_64 ty)
+            (iconst ty (u64_from_imm64 k1))
+            (iconst ty (u64_from_imm64 k2))))
+      (subsume (iconst ty (imm64_masked ty (u64_and k1 k2)))))
+
+(rule (simplify
+       (bxor (fits_in_64 ty)
+            (iconst ty (u64_from_imm64 k1))
+            (iconst ty (u64_from_imm64 k2))))
+      (subsume (iconst ty (imm64_masked ty (u64_xor k1 k2)))))
+
+(rule (simplify
+       (bnot (fits_in_64 ty)
+            (iconst ty (u64_from_imm64 k))))
+      (subsume (iconst ty (imm64_masked ty (u64_not k)))))
+
+;; Shift Operations
+(rule (simplify (ishl (fits_in_64 ty)
+                      (iconst ty k1)
+                      (iconst _ k2)))
+      (subsume (iconst ty (imm64_shl ty k1 k2))))
+
+(rule (simplify (ushr (fits_in_64 ty)
+                      (iconst ty k1)
+                      (iconst _ k2)))
+      (subsume (iconst ty (imm64_ushr ty k1 k2))))
+
+(rule (simplify (sshr (fits_in_64 ty)
+                      (iconst ty k1)
+                      (iconst _ k2)))
+      (subsume (iconst ty (imm64_sshr ty k1 k2))))
+
+;; Canonicalization and Associativity
+(rule (simplify
+       (iadd ty k @ (iconst ty _) x))
+      (iadd ty x k))
+(rule (simplify
+       (imul ty k @ (iconst ty _) x))
+      (imul ty x k))
+(rule (simplify
+       (bor ty k @ (iconst ty _) x))
+      (bor ty x k))
+(rule (simplify
+       (band ty k @ (iconst ty _) x))
+      (band ty x k))
+(rule (simplify
+       (bxor ty k @ (iconst ty _) x))
+      (bxor ty x k))
+
+;; Nested Associative Operations
+(rule (simplify
+       (iadd ty (iadd ty x k1 @ (iconst ty _)) k2 @ (iconst ty _)))
+      (iadd ty x (iadd ty k1 k2)))
+(rule (simplify
+       (imul ty (imul ty x k1 @ (iconst ty _)) k2 @ (iconst ty _)))
+      (imul ty x (imul ty k1 k2)))
+
+;; Floating-Point Arithmetic
+(rule (simplify (fadd $F32 (f32const $F32 lhs) (f32const $F32 rhs)))
+      (if-let r (f32_add lhs rhs))
+      (subsume (f32const $F32 r)))
+
+(rule (simplify (fsub $F32 (f32const $F32 lhs) (f32const $F32 rhs)))
+      (if-let r (f32_sub lhs rhs))
+      (subsume (f32const $F32 r)))
+
+(rule (simplify (fmul $F32 (f32const $F32 lhs) (f32const $F32 rhs)))
+      (if-let r (f32_mul lhs rhs))
+      (subsume (f32const $F32 r)))
+
+(rule (simplify (sqrt $F32 (f32const $F32 n)))
+      (if-let r (f32_sqrt n))
+      (subsume (f32const $F32 r)))
+
+(rule (simplify (fabs $F32 (f32const $F32 n)))
+      (subsume (f32const $F32 (f32_abs n))))
+
+(rule (simplify (fneg $F32 (f32const $F32 n)))
+      (subsume (f32const $F32 (f32_neg n))))
+
+;; Splats and Vector Constants
+(rule (simplify (splat dst (iconst $I32 n)))
+      (vconst dst (splat32 (u64_uextend_imm64 $I32 n))))
+(rule (simplify (splat dst (f32const $F32 n)))
+      (vconst dst (splat32 n)))
+
+(decl splat32 (u64) Constant)
+(rule (splat32 n) (splat64 (u64_or n (u64_shl n 32))))
+(decl splat64 (u64) Constant)
+(extern constructor splat64 splat64)

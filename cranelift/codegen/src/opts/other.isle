@@ -1,0 +1,119 @@
+;; Other Optimizations
+
+;; Simplify multiply by constants using shifts.
+(rule (simplify (imul ty x (iconst _ c)))
+      (if-let true (is_power_of_two c))
+      (ishl ty x (iconst _ (log2 c))))
+
+(rule (simplify (imul ty (iconst _ c) x))
+      (if-let true (is_power_of_two c))
+      (ishl ty x (iconst _ (log2 c))))
+
+;; Replace division by constants with multiply and shift when applicable.
+(rule (simplify (udiv ty x (iconst _ c)))
+      (if-let true (is_power_of_two c))
+      (ushr ty x (iconst _ (log2 c))))
+
+(rule (simplify (sdiv ty x (iconst _ c)))
+      (if-let true (is_power_of_two c))
+      (sshr ty x (iconst _ (log2 c))))
+
+;; Combine adjacent negations.
+(rule (simplify (ineg _ (ineg _ x))) x)
+
+;; Optimize double sign-extension or zero-extension.
+(rule (simplify (sextend ty (sextend _ x))) (sextend ty x))
+(rule (simplify (uextend ty (uextend _ x))) (uextend ty x))
+
+;; Remove redundant zero-extension after signed comparison.
+(rule (simplify (uextend _ (icmp _ _ x y))) (icmp _ _ x y))
+
+;; Simplify nested select operations with identical conditions.
+(rule (simplify (select ty cond
+                           (select ty cond x y)
+                           z))
+      (select ty cond x z))
+
+(rule (simplify (select ty cond
+                           x
+                           (select ty cond y z)))
+      (select ty cond x z))
+
+;; Simplify redundant `rotl` or `rotr` sequences.
+(rule (simplify (rotl ty (rotl ty x k1) k2))
+      (rotl ty x (iadd ty k1 k2)))
+
+(rule (simplify (rotr ty (rotr ty x k1) k2))
+      (rotr ty x (iadd ty k1 k2)))
+
+;; Fold constant rotate amounts.
+(rule (simplify (rotl ty x (iconst _ k)))
+      (if-let normalized_k (u64_mod k (ty_bits_u64 ty)))
+      (rotl ty x (iconst _ normalized_k)))
+
+(rule (simplify (rotr ty x (iconst _ k)))
+      (if-let normalized_k (u64_mod k (ty_bits_u64 ty)))
+      (rotr ty x (iconst _ normalized_k)))
+
+;; Simplify bitmask patterns.
+(rule (simplify (band ty x (bnot ty (bnot ty y)))) (band ty x y))
+
+(rule (simplify (bor ty x (bnot ty (bnot ty y)))) (bor ty x y))
+
+(rule (simplify (bxor ty x (bnot ty (bnot ty y)))) (bxor ty x y))
+
+;; Simplify `xor` with itself.
+(rule (simplify (bxor ty x x)) (iconst _ 0))
+
+;; Simplify `or` with all bits set.
+(rule (simplify (bor ty x (iconst _ -1))) (iconst _ -1))
+
+;; Simplify bit-shift overflow cases.
+(rule (simplify (ishl ty x (iconst _ k)))
+      (if-let true (u64_ge k (ty_bits_u64 ty)))
+      (iconst _ 0))
+
+(rule (simplify (ushr ty x (iconst _ k)))
+      (if-let true (u64_ge k (ty_bits_u64 ty)))
+      (iconst _ 0))
+
+(rule (simplify (sshr ty x (iconst _ k)))
+      (if-let true (u64_ge k (ty_bits_u64 ty)))
+      (iconst _ 0))
+
+;; Replace modulus with power-of-two constants by a bitmask.
+(rule (simplify (urem ty x (iconst _ c)))
+      (if-let true (is_power_of_two c))
+      (band ty x (iconst _ (c - 1))))
+
+(rule (simplify (srem ty x (iconst _ c)))
+      (if-let true (is_power_of_two c))
+      (band ty x (iconst _ (c - 1))))
+
+;; Canonicalize vector comparisons to scalar logic where possible.
+(rule (simplify (all_true ty (icmp ty cc (splat ty x) (splat ty y))))
+      (icmp (lane_type ty) cc x y))
+
+(rule (simplify (any_true ty (icmp ty cc (splat ty x) (splat ty y))))
+      (icmp (lane_type ty) cc x y))
+
+;; Simplify max/min with identical operands.
+(rule (simplify (umax ty x x)) x)
+(rule (simplify (umin ty x x)) x)
+(rule (simplify (smax ty x x)) x)
+(rule (simplify (smin ty x x)) x)
+
+;; Simplify redundant `select` over min/max.
+(rule (simplify (select ty (ugt _ x y) x y)) (umax ty x y))
+(rule (simplify (select ty (ult _ x y) x y)) (umin ty x y))
+(rule (simplify (select ty (sgt _ x y) x y)) (smax ty x y))
+(rule (simplify (select ty (slt _ x y) x y)) (smin ty x y))
+
+;; Simplify redundant vector operations.
+(rule (simplify (vadd ty (splat ty x) (splat ty y))) (splat ty (iadd (lane_type ty) x y)))
+(rule (simplify (vsub ty (splat ty x) (splat ty y))) (splat ty (isub (lane_type ty) x y)))
+
+;; Remove redundant loads from the same memory address.
+(rule (simplify (vload ty addr))
+      (if-let true (is_previously_loaded addr))
+      (previously_loaded_value addr))

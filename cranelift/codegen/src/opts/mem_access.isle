@@ -1,0 +1,163 @@
+;; `memory_access.isle` - Optimizations for memory loads, stores, and access patterns.
+
+;; Load/Store Redundancy Elimination
+;; ---------------------------------
+
+;; Eliminate redundant consecutive loads from the same address.
+(rule (simplify (load ty addr)
+                (load _ addr)))
+      (subsume (load ty addr)))
+
+;; Remove unnecessary stores when the value being stored is already in memory.
+(rule (simplify (store ty addr value)
+                (load ty addr)))
+      (subsume (store ty addr value)))
+
+;; Merge consecutive stores of the same value.
+(rule (simplify (store ty addr value)
+                (store ty addr value)))
+      (subsume (store ty addr value)))
+
+;; Combine adjacent memory accesses into wider accesses when alignment permits.
+(rule (simplify (store ty addr1 value1)
+                (store ty addr2 value2)))
+      (if-let true (memory_adjacent addr1 addr2 ty))
+      (combine_store ty addr1 value1 value2))
+
+;; Common Subexpression Elimination
+;; --------------------------------
+
+;; If two loads from the same address are used in the same block, reuse the result.
+(rule (simplify (load ty addr)
+                (load ty addr)))
+      (subsume (load ty addr)))
+
+;; Propagate a previous store into a subsequent load if there are no intermediate memory accesses.
+(rule (simplify (load ty addr)
+                (store ty addr value)))
+      (if-let true (no_intermediate_memory_access addr))
+      (subsume value))
+
+;; Load/Store Simplifications
+;; --------------------------
+
+;; Remove a store if the value is never read.
+(rule (simplify (store ty addr _))
+      (if-let false (is_read addr))
+      (subsume nop))
+
+;; Coalesce multiple loads into a single wide load if alignment allows.
+(rule (simplify (load ty addr1)
+                (load ty addr2)))
+      (if-let true (memory_adjacent addr1 addr2 ty))
+      (combine_load ty addr1 addr2))
+
+;; Precompute memory addresses for load/store if they're constant or partially constant.
+(rule (simplify (load ty (iadd _ base (iconst _ offset))))
+      (load ty (precompute_address base offset)))
+
+(rule (simplify (store ty (iadd _ base (iconst _ offset)) value))
+      (store ty (precompute_address base offset) value))
+
+;; Alias Analysis
+;; --------------
+
+;; Skip a load if it is known that the address contains the same value as a prior store.
+(rule (simplify (load ty addr)
+                (store ty addr value)))
+      (if-let true (no_alias addr))
+      (subsume value))
+
+;; Avoid stores to memory regions marked as readonly.
+(rule (simplify (store ty addr _))
+      (if-let true (is_readonly addr))
+      (subsume nop))
+
+;; Alignments and Width Optimizations
+;; ----------------------------------
+
+;; Widen load/store operations to use the maximum permissible alignment.
+(rule (simplify (load ty addr))
+      (if-let aligned_addr (align_address addr ty))
+      (load ty aligned_addr))
+
+(rule (simplify (store ty addr value))
+      (if-let aligned_addr (align_address addr ty))
+      (store ty aligned_addr value))
+
+;; Replace narrow load/store with wider equivalents when alignment allows.
+(rule (simplify (store ty addr1 (ireduce _ value)))
+      (if-let true (can_use_wide_access addr1 ty))
+      (store_wide ty addr1 value))
+
+(rule (simplify (load ty addr1))
+      (if-let true (can_use_wide_access addr1 ty))
+      (load_wide ty addr1))
+
+;; Zero Stores
+;; -----------
+
+;; Optimize memory clearing (storing zero to memory) into wider stores when alignment allows.
+(rule (simplify (store ty addr (iconst _ 0))))
+      (if-let true (can_use_wide_access addr ty))
+      (store_wide_zero ty addr))
+
+;; Replace consecutive zeroing stores with a memset-like operation.
+(rule (simplify (store ty addr1 (iconst _ 0))
+                (store ty addr2 (iconst _ 0))))
+      (if-let true (memory_adjacent addr1 addr2 ty))
+      (memset_zero addr1 ty))
+
+;; Memory Copy
+;; -----------
+
+;; Replace consecutive memory copy operations with a memcpy-like operation.
+(rule (simplify (store ty addr1 (load ty addr2))
+                (store ty addr3 (load ty addr4))))
+      (if-let true (memory_adjacent addr1 addr3 ty))
+      (memcpy addr1 addr2 ty))
+
+;; Unaligned Access Handling
+;; -------------------------
+
+;; Align unaligned memory loads by combining multiple narrower accesses.
+(rule (simplify (load ty_unaligned addr))
+      (if-let aligned_addr (align_address addr ty_unaligned))
+      (combine_load_unaligned ty_unaligned aligned_addr))
+
+;; Align unaligned memory stores by splitting into multiple narrower accesses.
+(rule (simplify (store ty_unaligned addr value))
+      (if-let aligned_addr (align_address addr ty_unaligned))
+      (split_store_unaligned ty_unaligned aligned_addr value))
+
+;; Preloading and Prefetching
+;; --------------------------
+
+;; Add prefetch instructions for loads from high-latency memory regions.
+(rule (simplify (load ty addr))
+      (if-let true (high_latency_memory addr))
+      (prefetch addr)
+      (load ty addr))
+
+;; Add writeback optimizations for stores to memory regions known to use writeback caching.
+(rule (simplify (store ty addr value))
+      (if-let true (writeback_memory addr))
+      (store_with_writeback ty addr value))
+
+;; Miscellaneous
+;; -------------
+
+;; Remove redundant memory barriers.
+(rule (simplify (memory_barrier)
+                (memory_barrier)))
+      (subsume nop))
+
+;; Simplify memory barriers when only partial barriers are necessary.
+(rule (simplify (memory_barrier))
+      (if-let true (is_partial_barrier_necessary))
+      (partial_memory_barrier))
+
+;; Coalesce adjacent memory barriers into a single barrier.
+(rule (simplify (memory_barrier)
+                (memory_barrier)))
+      (subsume memory_barrier)

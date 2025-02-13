@@ -1,0 +1,149 @@
+;; Strength Reduction Rules
+;;
+;; Optimizes expensive arithmetic operations into simpler, more efficient ones.
+
+;; ----------------------------------------
+;; 1. Multiplications to Shifts
+;; ----------------------------------------
+
+;; x * 2^k -> x << k
+(rule (simplify (imul ty x (iconst_u ty (imm64_power_of_two k))))
+      (ishl ty x (iconst_u ty (imm64 k))))
+
+;; x * 2 -> x << 1
+(rule (simplify (imul ty x (iconst_u ty 2)))
+      (ishl ty x (iconst_u ty 1)))
+
+;; x * -2^k -> -(x << k)
+(rule (simplify (imul ty x (iconst_s ty (imm64_neg_power_of_two k))))
+      (ineg ty (ishl ty x (iconst_u ty (imm64 k)))))
+
+;; x * 0 == 0
+(rule (simplify (imul ty _ (iconst_u ty 0)))
+      (iconst_u ty 0))
+
+;; x * 1 == x
+(rule (simplify (imul ty x (iconst_u ty 1)))
+      (subsume x))
+
+;; ----------------------------------------
+;; 2. Divisions to Shifts and Multiplications
+;; ----------------------------------------
+
+;; x / 2^k -> x >> k (logical for unsigned types)
+(rule (simplify (udiv ty x (iconst_u ty (imm64_power_of_two k))))
+      (ushr ty x (iconst_u ty (imm64 k))))
+
+;; x / 2^k -> x >> k (arithmetic for signed types)
+(rule (simplify (sdiv ty x (iconst_s ty (imm64_power_of_two k))))
+      (sshr ty x (iconst_u ty (imm64 k))))
+
+;; x / -2^k -> -(x >> k)
+(rule (simplify (sdiv ty x (iconst_s ty (imm64_neg_power_of_two k))))
+      (ineg ty (sshr ty x (iconst_u ty (imm64 k)))))
+
+;; x / 1 == x
+(rule (simplify (udiv ty x (iconst_u ty 1)))
+      (subsume x))
+(rule (simplify (sdiv ty x (iconst_s ty 1)))
+      (subsume x))
+
+;; x / -1 == -x
+(rule (simplify (sdiv ty x (iconst_s ty -1)))
+      (ineg ty x))
+
+;; Replace division by constants with "magic number" multiplication.
+(rule (simplify (udiv ty x (iconst_u ty k)))
+      (if-let magic (calculate_magic_number k))
+      (imul ty x (iconst_u ty magic)))
+
+;; ----------------------------------------
+;; 3. Modulo with Powers of Two
+;; ----------------------------------------
+
+;; x % 2^k -> x & (2^k - 1)
+(rule (simplify (urem ty x (iconst_u ty (imm64_power_of_two k))))
+      (band ty x (iconst_u ty (imm64_sub (imm64_shift ty k) (imm64 1)))))
+
+;; x % -2^k -> x & (2^k - 1)
+(rule (simplify (srem ty x (iconst_s ty (imm64_neg_power_of_two k))))
+      (band ty x (iconst_u ty (imm64_sub (imm64_shift ty k) (imm64 1)))))
+
+;; x % 1 == 0
+(rule (simplify (urem ty x (iconst_u ty 1)))
+      (iconst_u ty 0))
+(rule (simplify (srem ty x (iconst_s ty 1)))
+      (iconst_s ty 0))
+
+;; ----------------------------------------
+;; 4. Addition and Subtraction Chains
+;; ----------------------------------------
+
+;; x + x -> x << 1
+(rule (simplify (iadd ty x x))
+      (ishl ty x (iconst_u ty 1)))
+
+;; x + x + x -> x * 3
+(rule (simplify (iadd ty (iadd ty x x) x))
+      (imul ty x (iconst_u ty 3)))
+
+;; x - x == 0
+(rule (simplify (isub ty x x))
+      (iconst_u ty 0))
+
+;; -(x + y) -> -x - y
+(rule (simplify (ineg ty (iadd ty x y)))
+      (isub ty (ineg ty x) y))
+
+;; ----------------------------------------
+;; 5. Polynomial Simplifications
+;; ----------------------------------------
+
+;; x^2 * x^3 -> x^5
+(rule (simplify (imul ty (imul ty x x) (imul ty x (imul ty x x))))
+      (imul ty x (imul ty x (imul ty x x))))
+
+;; x^3 -> x * x * x
+(rule (simplify (imul ty (imul ty x x) x))
+      (imul ty x (imul ty x x)))
+
+;; ----------------------------------------
+;; 6. Vectorized Strength Reduction
+;; ----------------------------------------
+
+;; Apply splat optimizations to arithmetic operations
+(rule (simplify (imul ty (splat ty x) (splat ty y)))
+      (splat ty (imul (lane_type ty) x y)))
+
+(rule (simplify (iadd ty (splat ty x) (splat ty y)))
+      (splat ty (iadd (lane_type ty) x y)))
+
+;; Apply strength reduction to vector shifts
+(rule (simplify (ishl ty (splat ty x) y))
+      (splat ty (ishl (lane_type ty) x y)))
+
+(rule (simplify (ushr ty (splat ty x) y))
+      (splat ty (ushr (lane_type ty) x y)))
+
+(rule (simplify (sshr ty (splat ty x) y))
+      (splat ty (sshr (lane_type ty) x y)))
+
+;; ----------------------------------------
+;; 7. Rotate Optimizations
+;; ----------------------------------------
+
+;; Convert rotates into equivalent shifts where applicable
+(rule (simplify (rotl ty x (iconst_u ty k)))
+      (ishl ty x (iconst_u ty k)))
+
+(rule (simplify (rotr ty x (iconst_u ty k)))
+      (ushr ty x (iconst_u ty k)))
+
+;; ----------------------------------------
+;; 8. Miscellaneous
+;; ----------------------------------------
+
+;; Normalize shift amounts
+(rule (simplify (ishl ty x (iconst_u ty k)))
+      (if-let true (u64_lt k (ty_bits_u64 ty)))
+      (ishl ty x (iconst_u ty (u64_and k (ty_shift_mask ty)))))

@@ -1,0 +1,134 @@
+;; `constant_inlining.isle` - Optimizations for constant propagation, folding, and inlining
+
+;; Constant Propagation
+;; --------------------
+
+;; Inline constants directly into expressions to eliminate intermediate values.
+(rule (simplify (iadd ty const@(iconst _ _) x)) (iadd ty x const))
+(rule (simplify (imul ty const@(iconst _ _) x)) (imul ty x const))
+(rule (simplify (isub ty const@(iconst _ _) x)) (isub ty x const))
+
+;; Fold constants within binary operations.
+(rule (simplify (iadd ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (imm64_masked ty (u64_add c1 c2)))))
+
+(rule (simplify (imul ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (imm64_masked ty (u64_mul c1 c2)))))
+
+(rule (simplify (isub ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (imm64_masked ty (u64_sub c1 c2)))))
+
+(rule (simplify (band ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (imm64_masked ty (u64_and c1 c2)))))
+
+(rule (simplify (bor ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (imm64_masked ty (u64_or c1 c2)))))
+
+(rule (simplify (bxor ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (imm64_masked ty (u64_xor c1 c2)))))
+
+;; Shift operations with constants.
+(rule (simplify (ishl ty (iconst ty c1) (iconst _ shift)))
+      (subsume (iconst ty (imm64_shl ty c1 shift))))
+
+(rule (simplify (ushr ty (iconst ty c1) (iconst _ shift)))
+      (subsume (iconst ty (imm64_ushr ty c1 shift))))
+
+(rule (simplify (sshr ty (iconst ty c1) (iconst _ shift)))
+      (subsume (iconst ty (imm64_sshr ty c1 shift))))
+
+;; Division and modulus with constants (handle divide-by-zero).
+(rule (simplify (sdiv ty (iconst ty c1) (iconst _ c2)))
+      (if-let div (u64_sdiv c1 c2))
+      (subsume (iconst ty (imm64_masked ty div))))
+
+(rule (simplify (udiv ty (iconst ty c1) (iconst _ c2)))
+      (if-let div (u64_udiv c1 c2))
+      (subsume (iconst ty (imm64_masked ty div))))
+
+(rule (simplify (srem ty (iconst ty c1) (iconst _ c2)))
+      (if-let rem (u64_srem c1 c2))
+      (subsume (iconst ty (imm64_masked ty rem))))
+
+(rule (simplify (urem ty (iconst ty c1) (iconst _ c2)))
+      (if-let rem (u64_urem c1 c2))
+      (subsume (iconst ty (imm64_masked ty rem))))
+
+;; Comparison Folding
+;; ------------------
+
+;; Evaluate constant comparisons at compile time.
+(rule (simplify (icmp ty cc (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (imm64_icmp ty cc c1 c2))))
+
+(rule (simplify (eq ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_eq c1 c2))))
+
+(rule (simplify (ne ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_ne c1 c2))))
+
+(rule (simplify (slt ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_slt c1 c2))))
+
+(rule (simplify (sle ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_sle c1 c2))))
+
+(rule (simplify (sgt ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_sgt c1 c2))))
+
+(rule (simplify (sge ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_sge c1 c2))))
+
+(rule (simplify (ult ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_ult c1 c2))))
+
+(rule (simplify (ule ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_ule c1 c2))))
+
+(rule (simplify (ugt ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_ugt c1 c2))))
+
+(rule (simplify (uge ty (iconst ty c1) (iconst ty c2)))
+      (subsume (iconst ty (u64_uge c1 c2))))
+
+;; Propagate constants through `select`.
+(rule (simplify (select ty cond@(iconst_u _ 1) x@(iconst _ _) _)) (subsume x))
+(rule (simplify (select ty cond@(iconst_u _ 0) _ y@(iconst _ _))) (subsume y))
+
+;; Floating-Point Constant Folding
+;; -------------------------------
+
+;; Evaluate simple floating-point expressions.
+(rule (simplify (fadd ty (f32const ty lhs) (f32const ty rhs)))
+      (if-let result (f32_add lhs rhs))
+      (subsume (f32const ty result)))
+
+(rule (simplify (fsub ty (f32const ty lhs) (f32const ty rhs)))
+      (if-let result (f32_sub lhs rhs))
+      (subsume (f32const ty result)))
+
+(rule (simplify (fmul ty (f32const ty lhs) (f32const ty rhs)))
+      (if-let result (f32_mul lhs rhs))
+      (subsume (f32const ty result)))
+
+(rule (simplify (fdiv ty (f32const ty lhs) (f32const ty rhs)))
+      (if-let result (f32_div lhs rhs))
+      (subsume (f32const ty result)))
+
+;; Evaluate constant floating-point comparisons.
+(rule (simplify (fcmp ty cc (f32const ty lhs) (f32const ty rhs)))
+      (if-let result (f32_fcmp cc lhs rhs))
+      (subsume (iconst_u ty result)))
+
+;; Optimization for Boolean Values
+;; -------------------------------
+
+;; Simplify Boolean operations with constants.
+(rule (simplify (and ty cond@(iconst_u _ 1) x)) (subsume x))
+(rule (simplify (and ty cond@(iconst_u _ 0) _)) (subsume (iconst_u ty 0)))
+
+(rule (simplify (or ty cond@(iconst_u _ 1) _)) (subsume (iconst_u ty 1)))
+(rule (simplify (or ty cond@(iconst_u _ 0) x)) (subsume x))
+
+(rule (simplify (xor ty x@(iconst_u _ 0) y)) (subsume y))
+(rule (simplify (xor ty x@(iconst_u _ 1) y)) (bnot ty y))

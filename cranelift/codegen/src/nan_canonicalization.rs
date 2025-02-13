@@ -67,31 +67,36 @@ fn add_nan_canon_seq(pos: &mut FuncCursor, inst: Inst, has_vector_support: bool)
     let comparison = FloatCC::Unordered;
 
     let vectorized_scalar_select = |pos: &mut FuncCursor, canon_nan: Value, ty: types::Type| {
-        let canon_nan = pos.ins().scalar_to_vector(ty, canon_nan);
-        let new_res = pos.ins().scalar_to_vector(ty, new_res);
-        let is_nan = pos.ins().fcmp(comparison, new_res, new_res);
-        let is_nan = pos.ins().bitcast(ty, MemFlags::new(), is_nan);
-        let simd_result = pos.ins().bitselect(is_nan, canon_nan, new_res);
-        pos.ins().with_result(val).extractlane(simd_result, 0);
+        let pos_ins = pos.ins();
+        let canon_nan = pos_ins.scalar_to_vector(ty, canon_nan);
+        let new_res = pos_ins.scalar_to_vector(ty, new_res);
+        let is_nan = pos_ins.fcmp(comparison, new_res, new_res);
+        let is_nan = pos_ins.bitcast(ty, MemFlags::new(), is_nan);
+        let simd_result = pos_ins.bitselect(is_nan, canon_nan, new_res);
+        pos_ins.with_result(val).extractlane(simd_result, 0);
     };
     let scalar_select = |pos: &mut FuncCursor, canon_nan: Value| {
-        let is_nan = pos.ins().fcmp(comparison, new_res, new_res);
-        pos.ins()
+        let pos_ins = pos.ins();
+        let is_nan = pos_ins.fcmp(comparison, new_res, new_res);
+        pos_ins()
             .with_result(val)
             .select(is_nan, canon_nan, new_res);
     };
 
     let vector_select = |pos: &mut FuncCursor, canon_nan: Value| {
-        let is_nan = pos.ins().fcmp(comparison, new_res, new_res);
-        let is_nan = pos.ins().bitcast(val_type, MemFlags::new(), is_nan);
-        pos.ins()
+        let pos_ins = pos.ins();
+        let is_nan = pos_ins.fcmp(comparison, new_res, new_res);
+        let is_nan = pos_ins.bitcast(val_type, MemFlags::new(), is_nan);
+        pos_ins
             .with_result(val)
             .bitselect(is_nan, canon_nan, new_res);
     };
 
+    let pos_ins = pos.ins();
+
     match val_type {
         types::F32 => {
-            let canon_nan = pos.ins().f32const(Ieee32::NAN);
+            let canon_nan = pos_ins.f32const(Ieee32::NAN);
             if has_vector_support {
                 vectorized_scalar_select(pos, canon_nan, types::F32X4);
             } else {
@@ -99,7 +104,7 @@ fn add_nan_canon_seq(pos: &mut FuncCursor, inst: Inst, has_vector_support: bool)
             }
         }
         types::F64 => {
-            let canon_nan = pos.ins().f64const(Ieee64::NAN);
+            let canon_nan = pos_ins.f64const(Ieee64::NAN);
             if has_vector_support {
                 vectorized_scalar_select(pos, canon_nan, types::F64X2);
             } else {
@@ -107,13 +112,13 @@ fn add_nan_canon_seq(pos: &mut FuncCursor, inst: Inst, has_vector_support: bool)
             }
         }
         types::F32X4 => {
-            let canon_nan = pos.ins().f32const(Ieee32::NAN);
-            let canon_nan = pos.ins().splat(types::F32X4, canon_nan);
+            let canon_nan = pos_ins.f32const(Ieee32::NAN);
+            let canon_nan = pos_ins.splat(types::F32X4, canon_nan);
             vector_select(pos, canon_nan);
         }
         types::F64X2 => {
-            let canon_nan = pos.ins().f64const(Ieee64::NAN);
-            let canon_nan = pos.ins().splat(types::F64X2, canon_nan);
+            let canon_nan = pos_ins.f64const(Ieee64::NAN);
+            let canon_nan = pos_ins.splat(types::F64X2, canon_nan);
             vector_select(pos, canon_nan);
         }
         _ => {

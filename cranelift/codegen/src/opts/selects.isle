@@ -86,3 +86,83 @@
                            (sextend ty a @ (value_type small))
                            (sextend ty b @ (value_type small))))
       (sextend ty (select small cond a b)))
+
+;; Remove redundant select and bitselect when both choices are the same
+(rule (simplify (select ty _ x x)) x)
+(rule (simplify (bitselect ty _ x x)) x)
+
+;; Push zeroes to the right to make the select "truthy"
+(rule (simplify (select sty (icmp cty cc x y)
+                        zero @ (iconst_u _ 0)
+                        nonzero @ (iconst_u _ (u64_nonzero _))))
+    (select sty (icmp cty (intcc_complement cc) x y) nonzero zero))
+
+;; Simplify select of `icmp` into uextend or bmask
+(rule (simplify (select ty cmp @ (icmp _ cc x y)
+                        (iconst_u _ 1)
+                        (iconst_u _ 0)))
+    (uextend_maybe ty cmp))
+(rule (simplify (select ty cmp @ (icmp _ cc x y)
+                        (iconst_s _ -1)
+                        (iconst_s _ 0)))
+    (bmask ty cmp))
+
+;; Transform select-of-icmp into {u,s}{min,max} instructions
+(rule (simplify (select ty (sgt _ x y) x y)) (smax ty x y))
+(rule (simplify (select ty (sge _ x y) x y)) (smax ty x y))
+(rule (simplify (select ty (ugt _ x y) x y)) (umax ty x y))
+(rule (simplify (select ty (uge _ x y) x y)) (umax ty x y))
+(rule (simplify (select ty (slt _ x y) x y)) (smin ty x y))
+(rule (simplify (select ty (sle _ x y) x y)) (smin ty x y))
+(rule (simplify (select ty (ult _ x y) x y)) (umin ty x y))
+(rule (simplify (select ty (ule _ x y) x y)) (umin ty x y))
+
+;; Same rules with swapped operands
+(rule (simplify (select ty (slt _ x y) y x)) (smax ty x y))
+(rule (simplify (select ty (sle _ x y) y x)) (smax ty x y))
+(rule (simplify (select ty (ult _ x y) y x)) (umax ty x y))
+(rule (simplify (select ty (ule _ x y) y x)) (umax ty x y))
+(rule (simplify (select ty (sgt _ x y) y x)) (smin ty x y))
+(rule (simplify (select ty (sge _ x y) y x)) (smin ty x y))
+(rule (simplify (select ty (ugt _ x y) y x)) (umin ty x y))
+(rule (simplify (select ty (uge _ x y) y x)) (umin ty x y))
+
+;; Transform bitselect-of-icmp into {u,s}{min,max} instructions
+(rule (simplify (bitselect ty @ (multi_lane _ _) (sgt _ x y) x y)) (smax ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (sge _ x y) x y)) (smax ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (ugt _ x y) x y)) (umax ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (uge _ x y) x y)) (umax ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (slt _ x y) x y)) (smin ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (sle _ x y) x y)) (smin ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (ult _ x y) x y)) (umin ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (ule _ x y) x y)) (umin ty x y))
+
+;; Same rules with swapped operands for bitselect
+(rule (simplify (bitselect ty @ (multi_lane _ _) (slt _ x y) y x)) (smax ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (sle _ x y) y x)) (smax ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (ult _ x y) y x)) (umax ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (ule _ x y) y x)) (umax ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (sgt _ x y) y x)) (smin ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (sge _ x y) y x)) (smin ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (ugt _ x y) y x)) (umin ty x y))
+(rule (simplify (bitselect ty @ (multi_lane _ _) (uge _ x y) y x)) (umin ty x y))
+
+;; Simplify bitwise select pattern into `bitselect`
+(rule (simplify (bor (ty_vec128 ty) (band ty c x) (band ty (bnot ty c) y)))
+      (bitselect ty c x y))
+(rule (simplify (bor (ty_vec128 ty) (band ty c x) (band ty y (bnot ty c))))
+      (bitselect ty c x y))
+(rule (simplify (bor (ty_vec128 ty) (band ty (bnot ty c) y) (band ty c x)))
+      (bitselect ty c x y))
+(rule (simplify (bor (ty_vec128 ty) (band ty y (bnot ty c)) (band ty x c)))
+      (bitselect ty c x y))
+
+;; Lift extend operations outside of `select` when both paths extend
+(rule (simplify (select ty cond
+                           (uextend ty a @ (value_type small))
+                           (uextend ty b @ (value_type small))))
+      (uextend ty (select small cond a b)))
+(rule (simplify (select ty cond
+                           (sextend ty a @ (value_type small))
+                           (sextend ty b @ (value_type small))))
+      (sextend ty (select small cond a b)))

@@ -1,0 +1,28 @@
+[package]
+name = "trc"
+version = "1.2.4"
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+authors = ["Eric Buehler"]
+description = "A faster Arc."
+homepage = "https://github.com/EricLBuehler/trc"
+repository = "https://github.com/EricLBuehler/trc"
+keywords = ["reference-counted", "thread-safe", "smart-pointer", "memory"]
+categories = ["memory-management", "data-structures", "concurrency"]
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[features]
+dyn_unstable = []
+serde = []
+stable_deref_trait = []
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[dependencies]
+serde = "1.0.189"
+stable_deref_trait = "1.2.0"

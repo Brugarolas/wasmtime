@@ -1,0 +1,78 @@
+;; `flow_control.isle` - Optimizations for branches, loops, and control flow
+
+;; Branch Simplifications
+;; ----------------------
+
+;; Remove branches with constant conditions.
+(rule (simplify (select ty cond@(iconst_u _ 1) x _)) (subsume x))
+(rule (simplify (select ty cond@(iconst_u _ 0) _ y)) (subsume y))
+
+;; Convert nested branches with the same condition into a single branch.
+(rule (simplify (select ty cond (select _ cond x y) z)) (select ty cond x z))
+
+;; Unreachable Code Elimination
+;; ----------------------------
+
+;; Remove code after unconditional jumps.
+(rule (simplify (if_block ty cond true_branch@(iconst_u _ 1) _)) (subsume true_branch))
+
+;; Remove branches with always-false conditions.
+(rule (simplify (if_block ty cond@(iconst_u _ 0) _ false_branch)) (subsume false_branch))
+
+;; Loop Transformations
+;; --------------------
+
+;; Loop invariant code motion: move constants outside loops.
+(rule (simplify (loop ty cond (iadd ty x@(iconst _ _) y) body))
+      (let ((new_x Value x))
+        (loop ty cond new_x (iadd ty new_x y))))
+
+;; Loop unrolling: partially unroll loops for small iteration counts.
+(rule (simplify (loop ty (ule _ counter@(iconst_u _ k) (iconst_u _ max_iters)) body))
+      (if-let true (u64_lt k max_iters))
+      (unroll_loop ty counter body k))
+
+;; Loop unswitching: split loops with invariant conditions.
+(rule (simplify (loop ty cond@(eq _ invariant@(iconst _ _) _) body))
+      (split_loop ty invariant cond body))
+
+;; Dead loop elimination: remove empty-body loops.
+(rule (simplify (loop _ _ _ (iconst_u _ 0))) (subsume (iconst_u _ 0)))
+
+;; Switch Case Optimization
+;; ------------------------
+
+;; Combine adjacent cases with identical outcomes.
+(rule (simplify (switch ty value
+                        [case1 case2] x
+                        [case3 case4] x))
+      (merge_cases ty value [case1 case2 case3 case4] x))
+
+;; Convert switch to jump table if cases are dense and contiguous.
+(rule (simplify (switch ty value cases body))
+      (if (cases_dense_contiguous cases))
+      (jump_table ty value cases body))
+
+;; Branch Prediction Improvements
+;; ------------------------------
+
+;; Reorder branches to prioritize more likely conditions.
+(rule (simplify (if_block ty cond likely_path unlikely_path))
+      (if cond_mostly_true cond likely_path unlikely_path))
+
+;; Tail Call Elimination
+;; ---------------------
+
+;; Replace recursive tail calls with loops.
+(rule (simplify (tail_call func args)) (convert_to_loop func args))
+
+;; Guard Simplification
+;; --------------------
+
+;; Simplify nested conditionals with common sub-expressions.
+(rule (simplify (and (and cond1 cond2) cond3)) (and cond1 (and cond2 cond3)))
+(rule (simplify (or (or cond1 cond2) cond3)) (or cond1 (or cond2 cond3)))
+
+;; Remove redundant boolean expressions.
+(rule (simplify (and cond cond)) (subsume cond))
+(rule (simplify (or cond cond)) (subsume cond))

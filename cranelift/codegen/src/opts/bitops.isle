@@ -186,3 +186,107 @@
           (iconst_u ty 0xff00))
         (ushr ty x (iconst_u ty 56))))))
   (bswap ty x))
+
+;; Simplifications for `band`, `bnot`, `bor`, `bxor`
+
+;; Logical Identity Simplifications:
+;; x | 0 == x
+(rule (simplify (bor ty x (iconst_u ty 0)))
+      (subsume x))
+;; x & -1 == x
+(rule (simplify (band ty x (iconst_s ty -1)))
+      (subsume x))
+;; x & 0 == 0
+(rule (simplify (band ty x (iconst_u ty 0)))
+      (subsume (iconst_u ty 0)))
+;; x ^ 0 == x
+(rule (simplify (bxor ty x (iconst_u ty 0)))
+      (subsume x))
+;; x ^ x == 0
+(rule (simplify (bxor ty x x))
+      (subsume (iconst_u ty 0)))
+
+;; Double Negation Elimination:
+;; not(not(x)) == x
+(rule (simplify (bnot ty (bnot ty x)))
+      (subsume x))
+
+;; Logical Distributive Simplifications:
+;; (x & y) | (x & z) == x & (y | z)
+(rule (simplify (bor ty (band ty x y) (band ty x z)))
+      (band ty x (bor ty y z)))
+
+;; De Morgan’s Laws:
+;; not(x | y) == not(x) & not(y)
+(rule (simplify (bnot ty (bor ty x y)))
+      (band ty (bnot ty x) (bnot ty y)))
+;; not(x & y) == not(x) | not(y)
+(rule (simplify (bnot ty (band ty x y)))
+      (bor ty (bnot ty x) (bnot ty y)))
+
+;; XOR Negation Simplifications:
+;; x ^ -1 == not(x)
+(rule (simplify (bxor ty x (iconst_s ty -1)))
+      (bnot ty x))
+
+;; Mask Simplifications:
+;; x & (~0 << n) == x << n
+(rule (simplify (band ty x (ishl ty (iconst_u ty -1) (iconst_u ty shift))))
+      (ishl ty x (iconst_u ty shift)))
+
+;; Propagating Truthiness:
+;; If an operation preserves truthiness (non-zero), simplify nested expressions.
+(rule (simplify (bmask ty v)) (if-let x (truthy v)) (bmask ty x))
+(rule (simplify (select ty v t f)) (if-let c (truthy v)) (select ty c t f))
+
+;; Combine Shifts for Efficiency:
+;; (x << n) >> n == x & (~0 >> n)
+(rule (simplify (ushr ty (ishl ty x (iconst_u ty shift1)) (iconst_u ty shift2)))
+      (if-let true (u64_eq shift1 shift2))
+      (band ty x (ushr ty (iconst_u ty -1) (iconst_u ty shift1))))
+
+;; Rotation Simplifications:
+;; rotl(rotl(x, n), m) == rotl(x, n + m)
+(rule (simplify (rotl ty (rotl ty x (iconst_u ty n)) (iconst_u ty m)))
+      (rotl ty x (iconst_u ty (u64_add n m))))
+;; rotr(rotr(x, n), m) == rotr(x, n + m)
+(rule (simplify (rotr ty (rotr ty x (iconst_u ty n)) (iconst_u ty m)))
+      (rotr ty x (iconst_u ty (u64_add n m))))
+
+;; Redundant Masking:
+;; (x & mask) & mask == x & mask
+(rule (simplify (band ty (band ty x mask) mask))
+      (band ty x mask))
+
+;; Byte-Swap and Bit-Reversal Simplifications:
+;; bswap(bswap(x)) == x
+(rule (simplify (bswap ty (bswap ty x)))
+      (subsume x))
+;; bitrev(bitrev(x)) == x
+(rule (simplify (bitrev ty (bitrev ty x)))
+      (subsume x))
+
+;; Mask with Zero Simplifications:
+;; (x & mask) | 0 == x & mask
+(rule (simplify (bor ty (band ty x mask) (iconst_u ty 0)))
+      (band ty x mask))
+;; (x | mask) & 0 == 0
+(rule (simplify (band ty (bor ty x mask) (iconst_u ty 0)))
+      (subsume (iconst_u ty 0)))
+
+;; Truthiness with Comparison:
+;; x != 0 ? 1 : 0 == bmask(x)
+(rule (simplify (select ty (ne ty x (iconst_u ty 0))
+                        (iconst_u ty 1)
+                        (iconst_u ty 0)))
+      (bmask ty x))
+
+;; Optimized Popcount:
+;; popcnt(x & mask) == popcnt(x) & mask
+(rule (simplify (popcnt ty (band ty x mask)))
+      (band ty (popcnt ty x) mask))
+
+;; Optimized Shift-Narrow Combination:
+;; (sextend (bmask x)) == bmask(x) for any type size
+(rule (simplify (sextend ty (bmask _ x))) (bmask ty x))
+(rule (simplify (ireduce ty (bmask _ x))) (bmask ty x))
