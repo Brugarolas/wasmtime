@@ -1,14 +1,15 @@
 //! Evaluating const expressions.
 
+use crate::prelude::*;
 use crate::runtime::vm::{Instance, VMGcRef, ValRaw, I31};
 use crate::store::{AutoAssertNoGc, StoreOpaque};
-use crate::{
-    prelude::*, ArrayRef, ArrayRefPre, ArrayType, StructRef, StructRefPre, StructType, Val,
-};
+#[cfg(feature = "gc")]
+use crate::{ArrayRef, ArrayRefPre, ArrayType, StructRef, StructRefPre, StructType, Val};
 use smallvec::SmallVec;
+use wasmtime_environ::{ConstExpr, ConstOp, FuncIndex, GlobalIndex};
+#[cfg(feature = "gc")]
 use wasmtime_environ::{
-    ConstExpr, ConstOp, FuncIndex, GlobalIndex, ModuleInternedTypeIndex, WasmCompositeInnerType,
-    WasmCompositeType, WasmSubType,
+    ModuleInternedTypeIndex, WasmCompositeInnerType, WasmCompositeType, WasmSubType,
 };
 
 /// An interpreter for const expressions.
@@ -33,11 +34,7 @@ impl<'a> ConstEvalContext<'a> {
 
     fn global_get(&mut self, store: &mut AutoAssertNoGc<'_>, index: GlobalIndex) -> Result<ValRaw> {
         unsafe {
-            let global = self
-                .instance
-                .defined_or_imported_global_ptr(index)
-                .as_ref()
-                .unwrap();
+            let global = self.instance.defined_or_imported_global_ptr(index).as_ref();
             global.to_val_raw(store, self.instance.env_module().globals[index].wasm_ty)
         }
     }

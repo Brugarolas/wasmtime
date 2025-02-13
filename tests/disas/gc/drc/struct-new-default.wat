@@ -16,7 +16,7 @@
 ;;     gv1 = load.i64 notrap aligned readonly gv0+8
 ;;     gv2 = load.i64 notrap aligned gv1+16
 ;;     gv3 = vmctx
-;;     sig0 = (i64 vmctx, i32 uext, i32 uext, i32 uext, i32 uext) -> i64 tail
+;;     sig0 = (i64 vmctx, i32, i32, i32, i32) -> i64 tail
 ;;     fn0 = colocated u1:27 sig0
 ;;     stack_limit = gv2
 ;;
@@ -50,7 +50,6 @@
 ;; @0021                               trapz v32, user1
 ;; @0021                               v33 = iadd.i64 v14, v29
 ;; @0021                               v34 = load.i64 notrap aligned v33
-;; @0021                               trapz v32, user1
 ;;                                     v51 = iconst.i64 1
 ;; @0021                               v35 = iadd v34, v51  ; v51 = 1
 ;; @0021                               store notrap aligned v35, v33

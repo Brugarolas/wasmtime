@@ -109,7 +109,7 @@
 ;;     gv1 = load.i64 notrap aligned readonly gv0+8
 ;;     gv2 = load.i64 notrap aligned gv1+16
 ;;     gv3 = vmctx
-;;     sig0 = (i64 vmctx, i32 uext) -> i64 tail
+;;     sig0 = (i64 vmctx, i32) -> i64 tail
 ;;     fn0 = colocated u1:26 sig0
 ;;     stack_limit = gv2
 ;;
@@ -150,16 +150,9 @@
 ;; @004e                               trapz v34, user1
 ;; @004e                               v35 = iadd.i64 v6, v31
 ;; @004e                               v36 = load.i64 notrap aligned v35
-;;                                     v55 = load.i32 notrap v58
-;; @004e                               v42 = uextend.i64 v55
-;; @004e                               v44 = uadd_overflow_trap v42, v30, user1  ; v30 = 8
-;; @004e                               v46 = uadd_overflow_trap v44, v30, user1  ; v30 = 8
-;; @004e                               v47 = icmp ule v46, v8
-;; @004e                               trapz v47, user1
 ;;                                     v62 = iconst.i64 1
 ;; @004e                               v37 = iadd v36, v62  ; v62 = 1
-;; @004e                               v48 = iadd.i64 v6, v44
-;; @004e                               store notrap aligned v37, v48
+;; @004e                               store notrap aligned v37, v35
 ;;                                     v54 = load.i32 notrap v58
 ;; @004e                               store notrap aligned v54, v22
 ;;                                     v65 = iconst.i64 4

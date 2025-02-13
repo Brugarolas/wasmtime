@@ -578,17 +578,16 @@
        ;; Jump to a known target: jmp simm32.
        (JmpKnown (dst MachLabel))
 
-       ;; One-way conditional branch: jcond cond target.
+       ;; Low-level one-way conditional branch: jcond cond target.
        ;;
-       ;; This instruction is useful when we have conditional jumps depending on
-       ;; more than two conditions, see for instance the lowering of Brif
-       ;; with Fcmp inputs.
-       ;;
-       ;; A note of caution: in contexts where the branch target is another
-       ;; block, this has to be the same successor as the one specified in the
-       ;; terminator branch of the current block.  Otherwise, this might confuse
-       ;; register allocation by creating new invisible edges.
-       (JmpIf (cc CC)
+       ;; This instruction is useful only for lower-level code
+       ;; generators that use the Cranelift instruction backend as an
+       ;; assembler library. The instruction is thus named after its
+       ;; primary user, Winch. This instruction *should not* be used
+       ;; by Cranelift proper and placed into VCode: it does not
+       ;; adhere to the basic-block invariant, namely that branches
+       ;; always end a block (with no fallthrough).
+       (WinchJmpIf (cc CC)
               (taken MachLabel))
 
        ;; Two-way conditional branch: jcond cond target target.
@@ -598,6 +597,17 @@
        (JmpCond (cc CC)
                 (taken MachLabel)
                 (not_taken MachLabel))
+
+       ;; Two-way conditional branch with a combination of conditions:
+       ;;
+       ;;   j(cc1 or cc2) target1 target2
+       ;;
+       ;; Emitted as a compound sequence of three branches -- `jcc1
+       ;; target1`, `jcc2 target1`, `jmp target2`.
+       (JmpCondOr (cc1 CC)
+                  (cc2 CC)
+                  (taken MachLabel)
+                  (not_taken MachLabel))
 
        ;; Jump-table sequence, as one compound instruction (see note in lower.rs
        ;; for rationale).
@@ -812,7 +822,10 @@
        (Unwind (inst UnwindInst))
 
        ;; A pseudoinstruction that just keeps a value alive.
-       (DummyUse (reg Reg))))
+       (DummyUse (reg Reg))
+
+       ;; An instruction assembled outside of cranelift-codegen.
+       (External (inst AssemblerInst))))
 
 (type OperandSize extern
       (enum Size8
@@ -2898,9 +2911,54 @@
                  (MInst.Mul size signed src1 src2 dst_lo dst_hi)
                  dst_lo)))
 
-;; Helper for emitting `and` instructions.
+;; Helpers for matching operands, extracting them into their assembler types.
+(decl is_imm8 (AssemblerImm8) GprMemImm)
+(extern extractor is_imm8 is_imm8)
+(decl is_imm16 (AssemblerImm16) GprMemImm)
+(extern extractor is_imm16 is_imm16)
+(decl is_imm32 (AssemblerImm32) GprMemImm)
+(extern extractor is_imm32 is_imm32)
+(decl is_gpr (AssemblerReadGprMem) GprMemImm)
+(extern extractor is_gpr is_gpr)
+(decl is_mem (AssemblerReadGprMem) GprMemImm)
+(extern extractor is_mem is_mem)
+(decl is_gpr_mem (AssemblerReadGprMem) GprMemImm)
+(extern extractor is_gpr_mem is_gpr_mem)
+
+;; Helpers to auto-convert to and from assembler types.
+(decl pure convert_gpr_to_assembler_read_write_gpr (Gpr) AssemblerReadWriteGpr)
+(extern constructor convert_gpr_to_assembler_read_write_gpr convert_gpr_to_assembler_read_write_gpr)
+(convert Gpr AssemblerReadWriteGpr convert_gpr_to_assembler_read_write_gpr)
+
+(decl pure convert_assembler_read_write_gpr_to_gpr (AssemblerReadWriteGpr) Gpr)
+(extern constructor convert_assembler_read_write_gpr_to_gpr convert_assembler_read_write_gpr_to_gpr)
+(convert AssemblerReadWriteGpr Gpr convert_assembler_read_write_gpr_to_gpr)
+
+(decl pure convert_gpr_to_assembler_read_write_gpr_mem (Gpr) AssemblerReadWriteGprMem)
+(extern constructor convert_gpr_to_assembler_read_write_gpr_mem convert_gpr_to_assembler_read_write_gpr_mem)
+(convert Gpr AssemblerReadWriteGprMem convert_gpr_to_assembler_read_write_gpr_mem)
+
+(decl pure convert_assembler_read_write_gpr_mem_to_gpr (AssemblerReadWriteGprMem) Gpr)
+(extern constructor convert_assembler_read_write_gpr_mem_to_gpr convert_assembler_read_write_gpr_mem_to_gpr)
+(convert AssemblerReadWriteGprMem Gpr convert_assembler_read_write_gpr_mem_to_gpr)
+
+;; Helper for emitting `and` instructions. The high-priority rules all make use
+;; of the new assembler lowerings, but we retain the original cranelift-codegen
+;; lowering as a fallback for the time being (TODO: eventually remove this).
+;; Note that, to avoid potential partial-register stalls, we use the 32-bit-wide
+;; instruction when we know the 8-bit or 16-bit values are both in registers.
 (decl x64_and (Type Gpr GprMemImm) Gpr)
-(rule (x64_and ty src1 src2)
+(rule 10 (x64_and $I8  src1 (is_imm8 src2))   (x64_andb_mi src1 src2))
+(rule 9 (x64_and $I16 src1 (is_imm16 src2))   (x64_andw_mi src1 src2))
+(rule 8 (x64_and $I32 src1 (is_imm32 src2))   (x64_andl_mi src1 src2))
+(rule 7 (x64_and $I64 src1 (is_imm32 src2))   (x64_andq_mi_sxlq src1 src2))
+(rule 6 (x64_and $I8  src1 (is_gpr src2))     (x64_andl_rm src1 src2))
+(rule 5 (x64_and $I8  src1 (is_mem src2))     (x64_andb_rm src1 src2))
+(rule 4 (x64_and $I16 src1 (is_gpr src2))     (x64_andl_rm src1 src2))
+(rule 3 (x64_and $I16 src1 (is_mem src2))     (x64_andw_rm src1 src2))
+(rule 2 (x64_and $I32 src1 (is_gpr_mem src2)) (x64_andl_rm src1 src2))
+(rule 1 (x64_and $I64 src1 (is_gpr_mem src2)) (x64_andq_rm src1 src2))
+(rule 0 (x64_and ty src1 src2)
       (alu_rmi_r ty
                  (AluRmiROpcode.And)
                  src1
@@ -5030,14 +5088,15 @@
 (rule (jmp_known target)
       (SideEffectNoResult.Inst (MInst.JmpKnown target)))
 
-(decl jmp_if (CC MachLabel) ConsumesFlags)
-(rule (jmp_if cc taken)
-      (ConsumesFlags.ConsumesFlagsSideEffect (MInst.JmpIf cc taken)))
-
 ;; Conditional jump based on the condition code.
 (decl jmp_cond (CC MachLabel MachLabel) ConsumesFlags)
 (rule (jmp_cond cc taken not_taken)
       (ConsumesFlags.ConsumesFlagsSideEffect (MInst.JmpCond cc taken not_taken)))
+
+;; Conditional jump based on the OR of two condition codes.
+(decl jmp_cond_or (CC CC MachLabel MachLabel) ConsumesFlags)
+(rule (jmp_cond_or cc1 cc2 taken not_taken)
+      (ConsumesFlags.ConsumesFlagsSideEffect (MInst.JmpCondOr cc1 cc2 taken not_taken)))
 
 ;; Conditional jump based on the result of an icmp.
 (decl jmp_cond_icmp (IcmpCondResult MachLabel MachLabel) SideEffectNoResult)
@@ -5050,14 +5109,12 @@
       (with_flags_side_effect producer (jmp_cond cc taken not_taken)))
 (rule (jmp_cond_fcmp (FcmpCondResult.AndCondition producer cc1 cc2) taken not_taken)
       (with_flags_side_effect producer
-                              (consumes_flags_concat
-                                (jmp_if (cc_invert cc1) not_taken)
-                                (jmp_cond (cc_invert cc2) not_taken taken))))
+                              ;; DeMorgan's rule: to get cc1 AND cc2, we do NOT (NOT cc1 OR NOT cc2).
+                              ;; The outer NOT comes from flipping `not_taken` and `taken`.
+                              (jmp_cond_or (cc_invert cc1) (cc_invert cc2) not_taken taken)))
 (rule (jmp_cond_fcmp (FcmpCondResult.OrCondition producer cc1 cc2) taken not_taken)
       (with_flags_side_effect producer
-                              (consumes_flags_concat
-                                (jmp_if cc1 taken)
-                                (jmp_cond cc2 taken not_taken))))
+                              (jmp_cond_or cc1 cc2 taken not_taken)))
 
 ;; Emit the compound instruction that does:
 ;;

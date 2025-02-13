@@ -5,13 +5,12 @@
 #![cfg_attr(pulley_tail_calls, allow(incomplete_features, unstable_features))]
 #![deny(missing_docs)]
 #![no_std]
-#![expect(clippy::allow_attributes_without_reason, reason = "crate not migrated")]
 
 #[cfg(feature = "std")]
 #[macro_use]
 extern crate std;
 
-#[allow(unused_extern_crates)] // Some cfg's don't use this.
+#[cfg(feature = "decode")]
 extern crate alloc;
 
 /// Calls the given macro with each opcode.
@@ -247,6 +246,10 @@ macro_rules! for_each_op {
             /// Move between `x` registers.
             xmov = Xmov { dst: XReg, src: XReg };
 
+            /// Set `dst = 0`
+            xzero = Xzero { dst: XReg };
+            /// Set `dst = 1`
+            xone = Xone { dst: XReg };
             /// Set `dst = sign_extend(imm8)`.
             xconst8 = Xconst8 { dst: XReg, imm: i8 };
             /// Set `dst = sign_extend(imm16)`.
@@ -271,6 +274,11 @@ macro_rules! for_each_op {
             xadd64_u8 = Xadd64U8 { dst: XReg, src1: XReg, src2: u8 };
             /// Same as `xadd64` but `src2` is a zero-extended 32-bit immediate.
             xadd64_u32 = Xadd64U32 { dst: XReg, src1: XReg, src2: u32 };
+
+            /// `low32(dst) = low32(src1) * low32(src2) + low32(src3)`
+            xmadd32 = Xmadd32 { dst: XReg, src1: XReg, src2: XReg, src3: XReg };
+            /// `dst = src1 * src2 + src3`
+            xmadd64 = Xmadd64 { dst: XReg, src1: XReg, src2: XReg, src3: XReg };
 
             /// 32-bit wrapping subtraction: `low32(dst) = low32(src1) - low32(src2)`.
             ///
@@ -453,6 +461,33 @@ macro_rules! for_each_op {
             /// `*(ptr + offset) = low64(src)`
             xstore64le_offset8 = XStore64LeOffset8 { ptr: XReg, offset: u8, src: XReg };
 
+            // wasm addressing modes
+            //
+            // g32 = 32-bit guest, arithmetic is zero-extending the `addr`
+            //       to the host pointer width.
+
+            /// `low32(dst) = zext_8_32(*(base + zext(addr) + offset))`
+            xload8_u32_g32 = XLoad8U32G32 { dst: XReg, base: XReg, addr: XReg, offset: u8 };
+            /// `low32(dst) = sext_8_32(*(base + zext(addr) + offset))`
+            xload8_s32_g32 = XLoad8S32G32 { dst: XReg, base: XReg, addr: XReg, offset: u8 };
+            /// `low32(dst) = zext_16_32(*(base + zext(addr) + offset))`
+            xload16le_u32_g32 = XLoad16LeU32G32 { dst: XReg, base: XReg, addr: XReg, offset: u8 };
+            /// `low32(dst) = sext_16_32(*(base + zext(addr) + offset))`
+            xload16le_s32_g32 = XLoad16LeS32G32 { dst: XReg, base: XReg, addr: XReg, offset: u8 };
+            /// `low32(dst) = *(base + zext(addr) + offset)`
+            xload32le_g32 = XLoad32LeG32 { dst: XReg, base: XReg, addr: XReg, offset: u8 };
+            /// `dst = *(base + zext(addr) + offset)`
+            xload64le_g32 = XLoad64LeG32 { dst: XReg, base: XReg, addr: XReg, offset: u8 };
+
+            /// `*(base + zext(addr) + offset) = low8(src)`
+            xstore8_g32 = XStore8G32 { base: XReg, addr: XReg, offset: u8, src: XReg };
+            /// `*(base + zext(addr) + offset) = low16(src)`
+            xstore16le_g32 = XStore16LeG32 { base: XReg, addr: XReg, offset: u8, src: XReg };
+            /// `*(base + zext(addr) + offset) = low32(src)`
+            xstore32le_g32 = XStore32LeG32 { base: XReg, addr: XReg, offset: u8, src: XReg };
+            /// `*(base + zext(addr) + offset) = src`
+            xstore64le_g32 = XStore64LeG32 { base: XReg, addr: XReg, offset: u8, src: XReg };
+
             /// `push lr; push fp; fp = sp`
             push_frame = PushFrame ;
             /// `sp = fp; pop fp; pop lr`
@@ -463,10 +498,10 @@ macro_rules! for_each_op {
             ///
             /// This is equivalent to `push_frame`, `stack_alloc32 amt`, then
             /// saving all of `regs` to the top of the stack just allocated.
-            push_frame_save = PushFrameSave { amt: u32, regs: RegSet<XReg> };
+            push_frame_save = PushFrameSave { amt: u16, regs: UpperRegSet<XReg> };
             /// Inverse of `push_frame_save`. Restores `regs` from the top of
             /// the stack, then runs `stack_free32 amt`, then runs `pop_frame`.
-            pop_frame_restore = PopFrameRestore { amt: u32, regs: RegSet<XReg> };
+            pop_frame_restore = PopFrameRestore { amt: u16, regs: UpperRegSet<XReg> };
 
             /// `sp = sp.checked_sub(amt)`
             stack_alloc32 = StackAlloc32 { amt: u32 };
@@ -581,11 +616,33 @@ macro_rules! for_each_op {
             /// `dst = low32(cond) ? if_nonzero : if_zero`
             xselect64 = XSelect64 { dst: XReg, cond: XReg, if_nonzero: XReg, if_zero: XReg };
 
-            /// `trapif(zext(low32(addr)) > bound - off)` (unsigned)
-            xbc32_bound64_trap = XBc32Bound64Trap { addr: XReg, bound: XReg, off: u8 };
-
-            /// `trapif(zext(low32(addr)) > low32(bound) - off)` (unsigned)
-            xbc32_bound32_trap = XBc32Bound32Trap { addr: XReg, bound: XReg, off: u8 };
+            /// `trapif(addr > bound_ptr - size)` (unsigned)
+            xbc32_bound_trap = XBc32BoundTrap {
+                addr: XReg,
+                bound: XReg,
+                size: u8
+            };
+            /// `trapif(addr > *(bound_ptr + bound_off) - size)` (unsigned)
+            ///
+            /// Note that the `bound_ptr + bound_off` load loads a
+            /// host-native-endian pointer-sized value.
+            xbc32_boundne_trap = XBc32BoundNeTrap {
+                addr: XReg,
+                bound_ptr: XReg,
+                bound_off: u8,
+                size: u8
+            };
+            /// `trapif(addr >= bound_ptr)` (unsigned)
+            xbc32_strict_bound_trap = XBc32StrictBoundTrap {
+                addr: XReg,
+                bound: XReg
+            };
+            /// `trapif(addr >= *(bound_ptr + bound_off))` (unsigned)
+            xbc32_strict_boundne_trap = XBc32StrictBoundNeTrap {
+                addr: XReg,
+                bound_ptr: XReg,
+                bound_off: u8
+            };
         }
     };
 }
@@ -651,24 +708,6 @@ macro_rules! for_each_extended_op {
             xbmask32 = Xbmask32 { dst: XReg, src: XReg };
             /// dst = if src == 0 { 0 } else { -1 }
             xbmask64 = Xbmask64 { dst: XReg, src: XReg };
-
-            /// `*sp = low32(src); sp = sp.checked_add(4)`
-            xpush32 = XPush32 { src: XReg };
-            /// `for src in srcs { xpush32 src }`
-            xpush32_many = XPush32Many { srcs: RegSet<XReg> };
-            /// `*sp = src; sp = sp.checked_add(8)`
-            xpush64 = XPush64 { src: XReg };
-            /// `for src in srcs { xpush64 src }`
-            xpush64_many = XPush64Many { srcs: RegSet<XReg> };
-
-            /// `*dst = *sp; sp -= 4`
-            xpop32 = XPop32 { dst: XReg };
-            /// `for dst in dsts.rev() { xpop32 dst }`
-            xpop32_many = XPop32Many { dsts: RegSet<XReg> };
-            /// `*dst = *sp; sp -= 8`
-            xpop64 = XPop64 { dst: XReg };
-            /// `for dst in dsts.rev() { xpop64 dst }`
-            xpop64_many = XPop64Many { dsts: RegSet<XReg> };
 
             /// `dst = zext(*(ptr + offset))`
             xload16be_u64_offset32 = XLoad16BeU64Offset32 { dst: XReg, ptr: XReg, offset: i32 };
@@ -1025,6 +1064,14 @@ macro_rules! for_each_extended_op {
             vf64x2_from_i64x2_s = VF64x2FromI64x2S { dst: VReg, src: VReg };
             /// Int-to-float conversion (same as `f64_from_x64_u`)
             vf64x2_from_i64x2_u = VF64x2FromI64x2U { dst: VReg, src: VReg };
+            /// Float-to-int conversion (same as `x32_from_f32_s`
+            vi32x4_from_f32x4_s = VI32x4FromF32x4S { dst: VReg, src: VReg };
+            /// Float-to-int conversion (same as `x32_from_f32_u`
+            vi32x4_from_f32x4_u = VI32x4FromF32x4U { dst: VReg, src: VReg };
+            /// Float-to-int conversion (same as `x64_from_f64_s`
+            vi64x2_from_f64x2_s = VI64x2FromF64x2S { dst: VReg, src: VReg };
+            /// Float-to-int conversion (same as `x64_from_f64_u`
+            vi64x2_from_f64x2_u = VI64x2FromF64x2U { dst: VReg, src: VReg };
 
             /// Widens the low lanes of the input vector, as signed, to twice
             /// the width.
@@ -1075,6 +1122,15 @@ macro_rules! for_each_extended_op {
             /// Narrows the two 32x4 vectors, assuming all input lanes are
             /// signed, to half the width. Narrowing is unsigned and saturating.
             vnarrow32x4_u = Vnarrow32x4U { operands: BinaryOperands<VReg> };
+            /// Narrows the two 64x2 vectors, assuming all input lanes are
+            /// signed, to half the width. Narrowing is signed and saturating.
+            vnarrow64x2_s = Vnarrow64x2S { operands: BinaryOperands<VReg> };
+            /// Narrows the two 64x2 vectors, assuming all input lanes are
+            /// signed, to half the width. Narrowing is unsigned and saturating.
+            vnarrow64x2_u = Vnarrow64x2U { operands: BinaryOperands<VReg> };
+            /// Narrows the two 64x2 vectors, assuming all input lanes are
+            /// unsigned, to half the width. Narrowing is unsigned and saturating.
+            vunarrow64x2_u = Vunarrow64x2U { operands: BinaryOperands<VReg> };
             /// Promotes the low two lanes of the f32x4 input to f64x2.
             vfpromotelow = VFpromoteLow { dst: VReg, src: VReg };
             /// Demotes the two f64x2 lanes to f32x2 and then extends with two
@@ -1285,6 +1341,9 @@ macro_rules! for_each_extended_op {
             /// `dst = ieee_fma(a, b, c)`
             vfma64x2 = Vfma64x2 { dst: VReg, a: VReg, b: VReg, c: VReg };
 
+            /// `dst = low32(cond) ? if_nonzero : if_zero`
+            vselect = Vselect { dst: VReg, cond: XReg, if_nonzero: VReg, if_zero: VReg };
+
             /// `dst_hi:dst_lo = lhs_hi:lhs_lo + rhs_hi:rhs_lo`
             xadd128 = Xadd128 {
                 dst_lo: XReg,
@@ -1329,6 +1388,12 @@ pub mod disas;
 pub mod encode;
 #[cfg(feature = "interp")]
 pub mod interp;
+#[cfg(feature = "profile")]
+pub mod profile;
+#[cfg(all(not(feature = "profile"), feature = "interp"))]
+mod profile_disabled;
+#[cfg(all(not(feature = "profile"), feature = "interp"))]
+use profile_disabled as profile;
 
 pub mod regs;
 pub use regs::*;
@@ -1342,12 +1407,12 @@ pub use op::*;
 pub mod opcode;
 pub use opcode::*;
 
-#[allow(dead_code)] // Unused in some `cfg`s.
+#[cfg(any(feature = "encode", feature = "decode"))]
 pub(crate) unsafe fn unreachable_unchecked<T>() -> T {
     #[cfg(debug_assertions)]
     unreachable!();
 
-    #[cfg_attr(debug_assertions, allow(unreachable_code))]
+    #[cfg(not(debug_assertions))]
     unsafe {
         core::hint::unreachable_unchecked()
     }

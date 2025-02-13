@@ -24,14 +24,14 @@
 ;;       cmpq    $0, %rcx
 ;;       jl      0x4a
 ;;   3d: movq    %r14, %rdi
-;;       callq   0x20c
+;;       callq   0x1f1
 ;;       movq    8(%rsp), %r14
 ;;       movq    8(%r14), %rax
 ;;       movq    (%rax), %r11
 ;;       addq    $2, %r11
 ;;       movq    %r11, (%rax)
-;;       movq    0x68(%r14), %rcx
-;;       movq    0x58(%r14), %rax
+;;       movq    0x58(%r14), %rcx
+;;       movq    0x48(%r14), %rax
 ;;       movq    %rcx, %rdi
 ;;       movq    %r14, %rsi
 ;;       callq   *%rax
@@ -66,7 +66,7 @@
 ;;       cmpq    $0, %rcx
 ;;       jl      0xea
 ;;   dd: movq    %r14, %rdi
-;;       callq   0x20c
+;;       callq   0x1f1
 ;;       movq    8(%rsp), %r14
 ;;       movq    8(%r14), %rax
 ;;       movq    (%rax), %r11

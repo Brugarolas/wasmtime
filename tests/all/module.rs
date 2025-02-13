@@ -6,20 +6,40 @@ use wasmtime_test_macros::wasmtime_test;
 
 #[test]
 fn checks_incompatible_target() -> Result<()> {
-    let mut target = target_lexicon::Triple::host();
-    target.operating_system = target_lexicon::OperatingSystem::Unknown;
-    match Module::new(
-        &Engine::new(Config::new().target(&target.to_string())?)?,
-        "(module)",
-    ) {
-        Ok(_) => unreachable!(),
-        Err(e) => assert!(
-            format!("{e:?}").contains("configuration does not match the host"),
-            "bad error: {e:?}"
-        ),
+    // For platforms that Cranelift supports make sure a mismatch generates an
+    // error
+    if cfg!(target_arch = "x86_64")
+        || cfg!(target_arch = "aarch64")
+        || cfg!(target_arch = "s390x")
+        || cfg!(target_arch = "riscv64")
+    {
+        let mut target = target_lexicon::Triple::host();
+        target.operating_system = target_lexicon::OperatingSystem::Unknown;
+        assert_invalid_target(&target.to_string())?;
     }
 
-    Ok(())
+    // Otherwise make sure that the wrong pulley target is rejected on all
+    // platforms.
+    let wrong_pulley = if cfg!(target_pointer_width = "32") {
+        "pulley64"
+    } else {
+        "pulley32"
+    };
+    assert_invalid_target(wrong_pulley)?;
+
+    return Ok(());
+
+    fn assert_invalid_target(target: &str) -> Result<()> {
+        match Module::new(&Engine::new(Config::new().target(target)?)?, "(module)") {
+            Ok(_) => unreachable!(),
+            Err(e) => assert!(
+                format!("{e:?}").contains("configuration does not match the host"),
+                "bad error: {e:?}"
+            ),
+        }
+
+        Ok(())
+    }
 }
 
 #[test]
@@ -45,7 +65,7 @@ fn caches_across_engines() {
         // differ in wasm features enabled (which can affect
         // runtime/compilation settings)
         let res = Module::deserialize(
-            &Engine::new(Config::new().wasm_threads(false)).unwrap(),
+            &Engine::new(Config::new().wasm_relaxed_simd(false)).unwrap(),
             &bytes,
         );
         assert!(res.is_err());
@@ -255,6 +275,7 @@ fn compile_a_component() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn tail_call_defaults() -> Result<()> {
     let wasm_with_tail_calls = "(module (func $a return_call $a))";
 
@@ -279,6 +300,7 @@ fn tail_call_defaults() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn cross_engine_module_exports() -> Result<()> {
     let a_engine = Engine::default();
     let b_engine = Engine::default();

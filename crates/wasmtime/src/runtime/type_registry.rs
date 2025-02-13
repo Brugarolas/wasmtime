@@ -263,11 +263,11 @@ impl core::ops::Deref for RegisteredType {
 
 impl PartialEq for RegisteredType {
     fn eq(&self, other: &Self) -> bool {
-        let eq = Arc::ptr_eq(&self.entry.0, &other.entry.0);
+        let eq = self.index == other.index && Engine::same(&self.engine, &other.engine);
 
         if cfg!(debug_assertions) {
             if eq {
-                assert!(Engine::same(&self.engine, &other.engine));
+                assert!(Arc::ptr_eq(&self.entry.0, &other.entry.0));
                 assert_eq!(self.ty, other.ty);
             } else {
                 assert!(self.ty != other.ty || !Engine::same(&self.engine, &other.engine));
@@ -365,6 +365,9 @@ impl RegisteredType {
         ty: Arc<WasmSubType>,
         layout: Option<GcLayout>,
     ) -> Self {
+        log::trace!(
+            "RegisteredType::from_parts({engine:?}, {entry:?}, {index:?}, {ty:?}, {layout:?})"
+        );
         debug_assert!(entry.0.registrations.load(Acquire) != 0);
         RegisteredType {
             engine,
@@ -389,6 +392,7 @@ impl RegisteredType {
     ///
     /// Only struct and array types have GC layouts; function types do not have
     /// layouts.
+    #[cfg(feature = "gc")]
     pub fn layout(&self) -> Option<&GcLayout> {
         self.layout.as_ref()
     }

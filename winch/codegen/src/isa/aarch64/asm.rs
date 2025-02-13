@@ -2,7 +2,8 @@
 use super::{address::Address, regs};
 use crate::aarch64::regs::zero;
 use crate::masm::{
-    DivKind, ExtendKind, FloatCmpKind, IntCmpKind, RemKind, RoundingMode, ShiftKind, TruncKind,
+    DivKind, Extend, ExtendKind, FloatCmpKind, IntCmpKind, RemKind, RoundingMode, ShiftKind,
+    Signed, TruncKind,
 };
 use crate::CallingConvention;
 use crate::{
@@ -195,21 +196,27 @@ impl Assembler {
     }
 
     /// Load a signed register.
-    pub fn sload(&mut self, addr: Address, rd: WritableReg, size: OperandSize) {
-        self.ldr(addr, rd, size, true);
+    pub fn sload(&mut self, addr: Address, rd: WritableReg, size: OperandSize, flags: MemFlags) {
+        self.ldr(addr, rd, size, true, flags);
     }
 
     /// Load an unsigned register.
-    pub fn uload(&mut self, addr: Address, rd: WritableReg, size: OperandSize) {
-        self.ldr(addr, rd, size, false);
+    pub fn uload(&mut self, addr: Address, rd: WritableReg, size: OperandSize, flags: MemFlags) {
+        self.ldr(addr, rd, size, false, flags);
     }
 
     /// Load address into a register.
-    fn ldr(&mut self, addr: Address, rd: WritableReg, size: OperandSize, signed: bool) {
+    fn ldr(
+        &mut self,
+        addr: Address,
+        rd: WritableReg,
+        size: OperandSize,
+        signed: bool,
+        flags: MemFlags,
+    ) {
         use OperandSize::*;
         let writable_reg = rd.map(Into::into);
         let mem: AMode = addr.try_into().unwrap();
-        let flags = MemFlags::trusted();
 
         let inst = match (rd.to_reg().is_int(), signed, size) {
             (_, false, S8) => Inst::ULoad8 {
@@ -440,8 +447,16 @@ impl Assembler {
         // we therefore sign-extend the operand.
         // see: https://github.com/bytecodealliance/wasmtime/issues/9766
         let size = if size == OperandSize::S32 && kind == DivKind::Signed {
-            self.extend(divisor, writable!(divisor), ExtendKind::I64Extend32S);
-            self.extend(dividend, writable!(dividend), ExtendKind::I64Extend32S);
+            self.extend(
+                divisor,
+                writable!(divisor),
+                ExtendKind::Signed(Extend::<Signed>::I64Extend32),
+            );
+            self.extend(
+                dividend,
+                writable!(dividend),
+                ExtendKind::Signed(Extend::<Signed>::I64Extend32),
+            );
             OperandSize::S64
         } else {
             size
@@ -471,8 +486,16 @@ impl Assembler {
         // we therefore sign-extend the operand.
         // see: https://github.com/bytecodealliance/wasmtime/issues/9766
         let size = if size == OperandSize::S32 && kind.is_signed() {
-            self.extend(divisor, writable!(divisor), ExtendKind::I64Extend32S);
-            self.extend(dividend, writable!(dividend), ExtendKind::I64Extend32S);
+            self.extend(
+                divisor,
+                writable!(divisor),
+                ExtendKind::Signed(Extend::<Signed>::I64Extend32),
+            );
+            self.extend(
+                dividend,
+                writable!(dividend),
+                ExtendKind::Signed(Extend::<Signed>::I64Extend32),
+            );
             OperandSize::S64
         } else {
             size

@@ -65,7 +65,8 @@ macro_rules! impl_reg {
 #[repr(u8)]
 #[derive(Debug,Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[allow(non_camel_case_types, missing_docs)]
+#[allow(missing_docs, reason = "self-describing variants")]
+#[expect(non_camel_case_types, reason = "matching in-asm register names")]
 #[rustfmt::skip]
 pub enum XReg {
     x0,  x1,  x2,  x3,  x4,  x5,  x6,  x7,  x8,  x9,
@@ -107,7 +108,8 @@ fn assert_special_start_is_right() {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[allow(non_camel_case_types, missing_docs)]
+#[allow(missing_docs, reason = "self-describing variants")]
+#[expect(non_camel_case_types, reason = "matching in-asm register names")]
 #[rustfmt::skip]
 pub enum FReg {
     f0,  f1,  f2,  f3,  f4,  f5,  f6,  f7,  f8,  f9,
@@ -120,7 +122,8 @@ pub enum FReg {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[allow(non_camel_case_types, missing_docs)]
+#[allow(missing_docs, reason = "self-describing variants")]
+#[expect(non_camel_case_types, reason = "matching in-asm register names")]
 #[rustfmt::skip]
 pub enum VReg {
     v0,  v1,  v2,  v3,  v4,  v5,  v6,  v7,  v8,  v9,
@@ -137,7 +140,7 @@ impl_reg!(VReg, V, 0..32);
 ///
 /// Never appears inside an instruction -- instructions always name a particular
 /// class of register -- but this is useful for testing and things like that.
-#[allow(missing_docs)]
+#[allow(missing_docs, reason = "self-describing variants")]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum AnyReg {
@@ -223,29 +226,32 @@ impl<D: Reg, S1: Reg> BinaryOperands<D, S1, U6> {
     }
 }
 
-/// A set of registers, packed into a 32-bit bitset.
-pub struct RegSet<R> {
-    bitset: ScalarBitSet<u32>,
+/// A set of "upper half" registers, packed into a 16-bit bitset.
+///
+/// Registers stored in this bitset are offset by 16 and represent the upper
+/// half of the 32 registers for each class.
+pub struct UpperRegSet<R> {
+    bitset: ScalarBitSet<u16>,
     phantom: PhantomData<R>,
 }
 
-impl<R: Reg> RegSet<R> {
+impl<R: Reg> UpperRegSet<R> {
     /// Create a `RegSet` from a `ScalarBitSet`.
-    pub fn from_bitset(bitset: ScalarBitSet<u32>) -> Self {
+    pub fn from_bitset(bitset: ScalarBitSet<u16>) -> Self {
         Self {
             bitset,
             phantom: PhantomData,
         }
     }
 
-    /// Convert a `RegSet` into a `ScalarBitSet`.
-    pub fn to_bitset(self) -> ScalarBitSet<u32> {
+    /// Convert a `UpperRegSet` into a `ScalarBitSet`.
+    pub fn to_bitset(self) -> ScalarBitSet<u16> {
         self.bitset
     }
 }
 
-impl<R: Reg> From<ScalarBitSet<u32>> for RegSet<R> {
-    fn from(bitset: ScalarBitSet<u32>) -> Self {
+impl<R: Reg> From<ScalarBitSet<u16>> for UpperRegSet<R> {
+    fn from(bitset: ScalarBitSet<u16>) -> Self {
         Self {
             bitset,
             phantom: PhantomData,
@@ -253,54 +259,44 @@ impl<R: Reg> From<ScalarBitSet<u32>> for RegSet<R> {
     }
 }
 
-impl<R: Reg> Into<ScalarBitSet<u32>> for RegSet<R> {
-    fn into(self) -> ScalarBitSet<u32> {
+impl<R: Reg> Into<ScalarBitSet<u16>> for UpperRegSet<R> {
+    fn into(self) -> ScalarBitSet<u16> {
         self.bitset
     }
 }
 
-impl<R: Reg> IntoIterator for RegSet<R> {
+impl<R: Reg> IntoIterator for UpperRegSet<R> {
     type Item = R;
-    type IntoIter = RegSetIntoIter<R>;
+    type IntoIter = UpperRegSetIntoIter<R>;
 
     fn into_iter(self) -> Self::IntoIter {
-        RegSetIntoIter {
+        UpperRegSetIntoIter {
             iter: self.bitset.into_iter(),
             _marker: PhantomData,
         }
     }
 }
 
-/// Returned iterator from `RegSet::into_iter`
-pub struct RegSetIntoIter<R> {
-    iter: cranelift_bitset::scalar::Iter<u32>,
+/// Returned iterator from `UpperRegSet::into_iter`
+pub struct UpperRegSetIntoIter<R> {
+    iter: cranelift_bitset::scalar::Iter<u16>,
     _marker: PhantomData<R>,
 }
 
-impl<R: Reg> Iterator for RegSetIntoIter<R> {
+impl<R: Reg> Iterator for UpperRegSetIntoIter<R> {
     type Item = R;
     fn next(&mut self) -> Option<R> {
-        Some(R::new(self.iter.next()?).unwrap())
+        Some(R::new(self.iter.next()? + 16).unwrap())
     }
 }
 
-impl<R: Reg> DoubleEndedIterator for RegSetIntoIter<R> {
+impl<R: Reg> DoubleEndedIterator for UpperRegSetIntoIter<R> {
     fn next_back(&mut self) -> Option<R> {
-        Some(R::new(self.iter.next_back()?).unwrap())
+        Some(R::new(self.iter.next_back()? + 16).unwrap())
     }
 }
 
-impl<R: Reg> FromIterator<R> for RegSet<R> {
-    fn from_iter<I: IntoIterator<Item = R>>(iter: I) -> Self {
-        let mut set = ScalarBitSet::new();
-        for reg in iter {
-            set.insert(reg.to_u8());
-        }
-        RegSet::from(set)
-    }
-}
-
-impl<R: Reg> Default for RegSet<R> {
+impl<R: Reg> Default for UpperRegSet<R> {
     fn default() -> Self {
         Self {
             bitset: Default::default(),
@@ -309,28 +305,28 @@ impl<R: Reg> Default for RegSet<R> {
     }
 }
 
-impl<R: Reg> Copy for RegSet<R> {}
-impl<R: Reg> Clone for RegSet<R> {
+impl<R: Reg> Copy for UpperRegSet<R> {}
+impl<R: Reg> Clone for UpperRegSet<R> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<R: Reg> PartialEq for RegSet<R> {
+impl<R: Reg> PartialEq for UpperRegSet<R> {
     fn eq(&self, other: &Self) -> bool {
         self.bitset == other.bitset
     }
 }
-impl<R: Reg> Eq for RegSet<R> {}
+impl<R: Reg> Eq for UpperRegSet<R> {}
 
-impl<R: Reg> fmt::Debug for RegSet<R> {
+impl<R: Reg> fmt::Debug for UpperRegSet<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.into_iter()).finish()
     }
 }
 
 #[cfg(feature = "arbitrary")]
-impl<'a, R: Reg> arbitrary::Arbitrary<'a> for RegSet<R> {
+impl<'a, R: Reg> arbitrary::Arbitrary<'a> for UpperRegSet<R> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         ScalarBitSet::arbitrary(u).map(Self::from)
     }

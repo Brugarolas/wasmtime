@@ -3,15 +3,15 @@
 use crate::decode::*;
 use crate::encode::Encode;
 use crate::imms::*;
+use crate::profile::{ExecutingPc, ExecutingPcRef};
 use crate::regs::*;
 use alloc::string::ToString;
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::fmt;
 use core::mem;
 use core::ops::ControlFlow;
 use core::ops::{Index, IndexMut};
 use core::ptr::NonNull;
-use sptr::Strict;
 use wasmtime_math::WasmFloat;
 mod debug;
 #[cfg(all(not(pulley_tail_calls), not(pulley_assume_llvm_makes_tail_calls)))]
@@ -24,6 +24,7 @@ const DEFAULT_STACK_SIZE: usize = 1 << 20; // 1 MiB
 /// A virtual machine for interpreting Pulley bytecode.
 pub struct Vm {
     state: MachineState,
+    executing_pc: ExecutingPc,
 }
 
 impl Default for Vm {
@@ -35,13 +36,14 @@ impl Default for Vm {
 impl Vm {
     /// Create a new virtual machine with the default stack size.
     pub fn new() -> Self {
-        Self::with_stack(vec![0; DEFAULT_STACK_SIZE])
+        Self::with_stack(DEFAULT_STACK_SIZE)
     }
 
     /// Create a new virtual machine with the given stack.
-    pub fn with_stack(stack: Vec<u8>) -> Self {
+    pub fn with_stack(stack_size: usize) -> Self {
         Self {
-            state: MachineState::with_stack(stack),
+            state: MachineState::with_stack(stack_size),
+            executing_pc: ExecutingPc::default(),
         }
     }
 
@@ -53,11 +55,6 @@ impl Vm {
     /// Get an exclusive reference to this VM's machine state.
     pub fn state_mut(&mut self) -> &mut MachineState {
         &mut self.state
-    }
-
-    /// Consumer this VM and return its stack storage.
-    pub fn into_stack(self) -> Vec<u8> {
-        self.state.stack
     }
 
     /// Call a bytecode function.
@@ -81,10 +78,10 @@ impl Vm {
     where
         T: IntoIterator<Item = RegType> + 'a,
     {
-        self.call_start(args);
+        let lr = self.call_start(args);
 
         match self.call_run(func) {
-            DoneReason::ReturnToHost(()) => DoneReason::ReturnToHost(self.call_end(rets)),
+            DoneReason::ReturnToHost(()) => DoneReason::ReturnToHost(self.call_end(lr, rets)),
             DoneReason::Trap { pc, kind } => DoneReason::Trap { pc, kind },
             DoneReason::CallIndirectHost { id, resume } => {
                 DoneReason::CallIndirectHost { id, resume }
@@ -95,13 +92,18 @@ impl Vm {
     /// Peforms the initial part of [`Vm::call`] in setting up the `args`
     /// provided in registers according to Pulley's ABI.
     ///
+    /// # Return
+    ///
+    /// Returns the old `lr` register value. The current `lr` value is replaced
+    /// with a sentinel that triggers a return to the host when returned-to.
+    ///
     /// # Unsafety
     ///
     /// All the same unsafety as `call` and additiionally, you must
     /// invoke `call_run` and then `call_end` after calling `call_start`.
     /// If you don't want to wrangle these invocations, use `call` instead
     /// of `call_{start,run,end}`.
-    pub unsafe fn call_start<'a>(&'a mut self, args: &[Val]) {
+    pub unsafe fn call_start<'a>(&'a mut self, args: &[Val]) -> *mut u8 {
         // NB: make sure this method stays in sync with
         // `PulleyMachineDeps::compute_arg_locs`!
 
@@ -125,6 +127,8 @@ impl Vm {
                 },
             }
         }
+
+        mem::replace(&mut self.state.lr, HOST_RETURN_ADDR)
     }
 
     /// Peforms the internal part of [`Vm::call`] where bytecode is actually
@@ -140,6 +144,7 @@ impl Vm {
         let interpreter = Interpreter {
             state: &mut self.state,
             pc: UnsafeBytecodeStream::new(pc),
+            executing_pc: self.executing_pc.as_ref(),
         };
         let done = interpreter.run();
         self.state.done_decode(done)
@@ -148,18 +153,23 @@ impl Vm {
     /// Peforms the tail end of [`Vm::call`] by returning the values as
     /// determined by `rets` according to Pulley's ABI.
     ///
+    /// The `old_ret` value should have been provided from `call_start`
+    /// previously.
+    ///
     /// # Unsafety
     ///
     /// In addition to the invariants documented for `call`, this may
     /// only be called after `call_run`.
     pub unsafe fn call_end<'a>(
         &'a mut self,
+        old_ret: *mut u8,
         rets: impl IntoIterator<Item = RegType> + 'a,
     ) -> impl Iterator<Item = Val> + 'a {
+        self.state.lr = old_ret;
         // NB: make sure this method stays in sync with
         // `PulleyMachineDeps::compute_arg_locs`!
 
-        let mut x_rets = (0..16).map(|x| XReg::new_unchecked(x));
+        let mut x_rets = (0..15).map(|x| XReg::new_unchecked(x));
         let mut f_rets = (0..16).map(|f| FReg::new_unchecked(f));
         let mut v_rets = (0..16).map(|v| VReg::new_unchecked(v));
 
@@ -197,6 +207,23 @@ impl Vm {
     /// Sets the current `lr` register value.
     pub unsafe fn set_lr(&mut self, lr: *mut u8) {
         self.state.lr = lr;
+    }
+
+    /// Gets a handle to the currently executing program counter for this
+    /// interpreter which can be read from other threads.
+    //
+    // Note that despite this field still existing with `not(feature =
+    // "profile")` it's hidden from the public API in that scenario as it has no
+    // methods anyway.
+    #[cfg(feature = "profile")]
+    pub fn executing_pc(&self) -> &ExecutingPc {
+        &self.executing_pc
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        self.executing_pc.set_done();
     }
 }
 
@@ -371,7 +398,18 @@ union XRegUnion {
     u32: u32,
     i64: i64,
     u64: u64,
-    ptr: *mut u8,
+
+    // Note that this is intentionally `usize` and not an actual pointer like
+    // `*mut u8`. The reason for this is that provenance is required in Rust for
+    // pointers but Cranelift has no pointer type and thus no concept of
+    // provenance. That means that at-rest it's not known whether the value has
+    // provenance or not and basically means that Pulley is required to use
+    // "permissive provenance" in Rust as opposed to strict provenance.
+    //
+    // That's more-or-less a long-winded way of saying that storage of a pointer
+    // in this value is done with `.expose_provenance()` and reading a pointer
+    // uses `with_exposed_provenance_mut(..)`.
+    ptr: usize,
 }
 
 impl Default for XRegVal {
@@ -380,7 +418,7 @@ impl Default for XRegVal {
     }
 }
 
-#[allow(missing_docs)]
+#[allow(missing_docs, reason = "self-describing methods")]
 impl XRegVal {
     pub fn new_i32(x: i32) -> Self {
         let mut val = XRegVal::default();
@@ -434,7 +472,11 @@ impl XRegVal {
 
     pub fn get_ptr<T>(&self) -> *mut T {
         let ptr = unsafe { self.0.ptr };
-        Strict::map_addr(ptr, |p| usize::from_le(p)).cast()
+        let ptr = usize::from_le(ptr);
+        #[cfg(has_provenance_apis)]
+        return core::ptr::with_exposed_provenance_mut(ptr);
+        #[cfg(not(has_provenance_apis))]
+        return ptr as *mut T;
     }
 
     pub fn set_i32(&mut self, x: i32) {
@@ -454,7 +496,11 @@ impl XRegVal {
     }
 
     pub fn set_ptr<T>(&mut self, ptr: *mut T) {
-        self.0.ptr = Strict::map_addr(ptr, |p| p.to_le()).cast();
+        #[cfg(has_provenance_apis)]
+        let ptr = ptr.expose_provenance();
+        #[cfg(not(has_provenance_apis))]
+        let ptr = ptr as usize;
+        self.0.ptr = ptr.to_le();
     }
 }
 
@@ -491,7 +537,7 @@ impl Default for FRegVal {
     }
 }
 
-#[allow(missing_docs)]
+#[allow(missing_docs, reason = "self-describing methods")]
 impl FRegVal {
     pub fn new_f32(f: f32) -> Self {
         let mut val = Self::default();
@@ -574,7 +620,7 @@ impl Default for VRegVal {
     }
 }
 
-#[allow(missing_docs)]
+#[allow(missing_docs, reason = "self-describing methods")]
 impl VRegVal {
     pub fn new_u128(i: u128) -> Self {
         let mut val = Self::default();
@@ -690,12 +736,68 @@ pub struct MachineState {
     v_regs: [VRegVal; VReg::RANGE.end as usize],
     fp: *mut u8,
     lr: *mut u8,
-    stack: Vec<u8>,
+    stack: Stack,
     done_reason: Option<DoneReason<()>>,
 }
 
 unsafe impl Send for MachineState {}
 unsafe impl Sync for MachineState {}
+
+/// Helper structure to store the state of the Pulley stack.
+///
+/// The Pulley stack notably needs to be a 16-byte aligned allocation on the
+/// host to ensure that addresses handed out are indeed 16-byte aligned. This is
+/// done with a custom `Vec<T>` internally where `T` has size and align of 16.
+/// This is manually done with a helper `Align16` type below.
+struct Stack {
+    storage: Vec<Align16>,
+}
+
+/// Helper type used with `Stack` above.
+#[derive(Copy, Clone)]
+#[repr(align(16))]
+struct Align16 {
+    // Just here to give the structure a size of 16. The alignment is always 16
+    // regardless of what the host platform's alignment of u128 is.
+    _unused: u128,
+}
+
+impl Stack {
+    /// Creates a new stack which will have a byte size of at least `size`.
+    ///
+    /// The allocated stack might be slightly larger due to rounding necessary.
+    fn new(size: usize) -> Stack {
+        Stack {
+            // Round up `size` to the nearest multiple of 16. Note that the
+            // stack is also allocated here but not initialized, and that's
+            // intentional as pulley bytecode should always initialize the stack
+            // before use.
+            storage: Vec::with_capacity((size + 15) / 16),
+        }
+    }
+
+    /// Returns a pointer to the top of the stack (the highest address).
+    ///
+    /// Note that the returned pointer has provenance for the entire stack
+    /// allocation, however, not just the top.
+    fn top(&mut self) -> *mut u8 {
+        let len = self.len();
+        unsafe { self.base().add(len) }
+    }
+
+    /// Returns a pointer to the base of the stack (the lowest address).
+    ///
+    /// Note that the returned pointer has provenance for the entire stack
+    /// allocation, however, not just the top.
+    fn base(&mut self) -> *mut u8 {
+        self.storage.as_mut_ptr().cast::<u8>()
+    }
+
+    /// Returns the length, in bytes, of this stack allocation.
+    fn len(&self) -> usize {
+        self.storage.capacity() * mem::size_of::<Align16>()
+    }
+}
 
 impl fmt::Debug for MachineState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -778,24 +880,18 @@ index_reg!(VReg, VRegVal, v_regs);
 const HOST_RETURN_ADDR: *mut u8 = usize::MAX as *mut u8;
 
 impl MachineState {
-    fn with_stack(stack: Vec<u8>) -> Self {
-        assert!(stack.len() > 0);
+    fn with_stack(stack_size: usize) -> Self {
         let mut state = Self {
             x_regs: [Default::default(); XReg::RANGE.end as usize],
             f_regs: Default::default(),
             v_regs: Default::default(),
-            stack,
+            stack: Stack::new(stack_size),
             done_reason: None,
             fp: HOST_RETURN_ADDR,
             lr: HOST_RETURN_ADDR,
         };
 
-        // Take care to construct SP such that we preserve pointer provenance
-        // for the whole stack.
-        let len = state.stack.len();
-        let sp = &mut state.stack[..];
-        let sp = sp.as_mut_ptr();
-        let sp = unsafe { sp.add(len) };
+        let sp = state.stack.top();
         state[XReg::sp] = XRegVal::new_ptr(sp);
 
         state
@@ -897,6 +993,7 @@ pub use done::{DoneReason, TrapKind};
 struct Interpreter<'a> {
     state: &'a mut MachineState,
     pc: UnsafeBytecodeStream,
+    executing_pc: ExecutingPcRef<'a>,
 }
 
 impl Interpreter<'_> {
@@ -953,7 +1050,7 @@ impl Interpreter<'_> {
     #[must_use]
     fn set_sp<I: Encode>(&mut self, sp: *mut u8) -> ControlFlow<Done> {
         let sp_raw = sp as usize;
-        let base_raw = self.state.stack.as_ptr() as usize;
+        let base_raw = self.state.stack.base() as usize;
         if sp_raw < base_raw {
             return self.done_trap::<I>();
         }
@@ -966,11 +1063,19 @@ impl Interpreter<'_> {
     fn set_sp_unchecked<T>(&mut self, sp: *mut T) {
         if cfg!(debug_assertions) {
             let sp_raw = sp as usize;
-            let base = self.state.stack.as_ptr() as usize;
+            let base = self.state.stack.base() as usize;
             let end = base + self.state.stack.len();
             assert!(base <= sp_raw && sp_raw <= end);
         }
         self.state[XReg::sp].set_ptr(sp);
+    }
+
+    /// Calculates the "g32" address given the inputs to the addressing mode.
+    fn g32_addr<T>(&self, base: XReg, addr: XReg, offset: u8) -> *mut T {
+        let addr = (self.state[base].get_ptr::<T>() as usize)
+            .wrapping_add(self.state[addr].get_u32() as usize)
+            .wrapping_add(usize::from(offset));
+        addr as *mut T
     }
 
     unsafe fn load<T>(&self, ptr: XReg, offset: i32) -> T {
@@ -982,11 +1087,25 @@ impl Interpreter<'_> {
         }
     }
 
+    /// The name "g32" here means that the guest pointer, the wasm address, is
+    /// always a 32-bit value. Arithmetic is done at the size of the
+    /// host-pointer-width.
+    unsafe fn load_g32<T>(&self, base: XReg, addr: XReg, offset: u8) -> T {
+        unsafe { self.g32_addr::<T>(base, addr, offset).read_unaligned() }
+    }
+
     unsafe fn store<T>(&self, ptr: XReg, offset: i32, val: T) {
         self.state[ptr]
             .get_ptr::<T>()
             .byte_offset(offset as isize)
             .write_unaligned(val)
+    }
+
+    /// Same as `load_g32` but for stores
+    unsafe fn store_g32<T>(&self, base: XReg, addr: XReg, offset: u8, val: T) {
+        unsafe {
+            self.g32_addr::<T>(base, addr, offset).write_unaligned(val);
+        }
     }
 
     fn check_xnn_from_fnn<I: Encode>(&mut self, val: f64, lo: f64, hi: f64) -> ControlFlow<Done> {
@@ -1010,17 +1129,24 @@ impl Interpreter<'_> {
         self.state[lo].set_u64(val as u64);
         self.state[hi].set_u64((val >> 64) as u64);
     }
+
+    fn record_executing_pc_for_profiling(&mut self) {
+        // Note that this is a no-op if `feature = "profile"` is disabled.
+        self.executing_pc.record(self.pc.as_ptr().as_ptr() as usize);
+    }
 }
 
 #[test]
 fn simple_push_pop() {
-    let mut state = MachineState::with_stack(vec![0; 16]);
+    let mut state = MachineState::with_stack(16);
+    let pc = ExecutingPc::default();
     unsafe {
         let mut bytecode = [0; 10];
         let mut i = Interpreter {
             state: &mut state,
             // this isn't actually read so just manufacture a dummy one
             pc: UnsafeBytecodeStream::new(NonNull::new(bytecode.as_mut_ptr().offset(4)).unwrap()),
+            executing_pc: pc.as_ref(),
         };
         assert!(i.push::<crate::Ret, _>(0_i32).is_continue());
         assert_eq!(i.pop::<i32>(), 0_i32);
@@ -1398,6 +1524,16 @@ impl OpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    fn xzero(&mut self, dst: XReg) -> ControlFlow<Done> {
+        self.state[dst].set_i64(0);
+        ControlFlow::Continue(())
+    }
+
+    fn xone(&mut self, dst: XReg) -> ControlFlow<Done> {
+        self.state[dst].set_i64(1);
+        ControlFlow::Continue(())
+    }
+
     fn xconst16(&mut self, dst: XReg, imm: i16) -> ControlFlow<Done> {
         self.state[dst].set_i64(i64::from(imm));
         ControlFlow::Continue(())
@@ -1444,6 +1580,22 @@ impl OpVisitor for Interpreter<'_> {
     fn xadd64_u32(&mut self, dst: XReg, src1: XReg, src2: u32) -> ControlFlow<Done> {
         let a = self.state[src1].get_u64();
         self.state[dst].set_u64(a.wrapping_add(src2.into()));
+        ControlFlow::Continue(())
+    }
+
+    fn xmadd32(&mut self, dst: XReg, src1: XReg, src2: XReg, src3: XReg) -> ControlFlow<Done> {
+        let a = self.state[src1].get_u32();
+        let b = self.state[src2].get_u32();
+        let c = self.state[src3].get_u32();
+        self.state[dst].set_u32(a.wrapping_mul(b).wrapping_add(c));
+        ControlFlow::Continue(())
+    }
+
+    fn xmadd64(&mut self, dst: XReg, src1: XReg, src2: XReg, src3: XReg) -> ControlFlow<Done> {
+        let a = self.state[src1].get_u64();
+        let b = self.state[src2].get_u64();
+        let c = self.state[src3].get_u64();
+        self.state[dst].set_u64(a.wrapping_mul(b).wrapping_add(c));
         ControlFlow::Continue(())
     }
 
@@ -1871,11 +2023,11 @@ impl OpVisitor for Interpreter<'_> {
     }
 
     #[inline]
-    fn push_frame_save(&mut self, amt: u32, regs: RegSet<XReg>) -> ControlFlow<Done> {
+    fn push_frame_save(&mut self, amt: u16, regs: UpperRegSet<XReg>) -> ControlFlow<Done> {
         // Decrement the stack pointer `amt` bytes plus 2 pointers more for
         // fp/lr.
         let ptr_size = size_of::<usize>();
-        let full_amt = usize::try_from(amt).unwrap() + 2 * ptr_size;
+        let full_amt = usize::from(amt) + 2 * ptr_size;
         let new_sp = self.state[XReg::sp].get_ptr::<u8>().wrapping_sub(full_amt);
         self.set_sp::<crate::PushFrameSave>(new_sp)?;
 
@@ -1900,11 +2052,11 @@ impl OpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
-    fn pop_frame_restore(&mut self, amt: u32, regs: RegSet<XReg>) -> ControlFlow<Done> {
+    fn pop_frame_restore(&mut self, amt: u16, regs: UpperRegSet<XReg>) -> ControlFlow<Done> {
         // Restore all registers in `regs`, followed by the normal `pop_frame`
         // opcode below to restore fp/lr.
         unsafe {
-            let mut offset = amt as i32;
+            let mut offset = i32::from(amt);
             for reg in regs {
                 offset -= 8;
                 let val = self.load(XReg::sp, offset);
@@ -1932,7 +2084,7 @@ impl OpVisitor for Interpreter<'_> {
         // Decode the `PcRelOffset` without tampering with `self.pc` as the
         // jump is relative to `self.pc`.
         let mut tmp = self.pc;
-        let rel = unwrap_uninhabited(PcRelOffset::decode(&mut tmp));
+        let Ok(rel) = PcRelOffset::decode(&mut tmp);
         let offset = isize::try_from(i32::from(rel)).unwrap();
         self.pc = unsafe { self.pc.offset(offset) };
         ControlFlow::Continue(())
@@ -2386,24 +2538,177 @@ impl OpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
-    fn xbc32_bound64_trap(&mut self, addr: XReg, bound: XReg, off: u8) -> ControlFlow<Done> {
-        let bound = self.state[bound].get_u64();
-        let addr = u64::from(self.state[addr].get_u32());
-        if addr > bound.wrapping_sub(u64::from(off)) {
-            self.done_trap::<crate::XBc32Bound64Trap>()
+    fn xbc32_bound_trap(&mut self, addr: XReg, bound: XReg, size: u8) -> ControlFlow<Done> {
+        let bound = self.state[bound].get_u64() as usize;
+        let addr = self.state[addr].get_u32() as usize;
+        if addr > bound.wrapping_sub(usize::from(size)) {
+            self.done_trap::<crate::XBc32BoundTrap>()
         } else {
             ControlFlow::Continue(())
         }
     }
 
-    fn xbc32_bound32_trap(&mut self, addr: XReg, bound: XReg, off: u8) -> ControlFlow<Done> {
-        let bound = self.state[bound].get_u32();
-        let addr = self.state[addr].get_u32();
-        if addr > bound.wrapping_sub(u32::from(off)) {
-            self.done_trap::<crate::XBc32Bound32Trap>()
+    fn xbc32_boundne_trap(
+        &mut self,
+        addr: XReg,
+        bound_ptr: XReg,
+        bound_off: u8,
+        size: u8,
+    ) -> ControlFlow<Done> {
+        let bound = unsafe { self.load::<usize>(bound_ptr, bound_off.into()) };
+        let addr = self.state[addr].get_u32() as usize;
+        if addr > bound.wrapping_sub(usize::from(size)) {
+            self.done_trap::<crate::XBc32BoundNeTrap>()
         } else {
             ControlFlow::Continue(())
         }
+    }
+
+    fn xbc32_strict_bound_trap(&mut self, addr: XReg, bound: XReg) -> ControlFlow<Done> {
+        let bound = self.state[bound].get_u64() as usize;
+        let addr = self.state[addr].get_u32() as usize;
+        if addr >= bound {
+            self.done_trap::<crate::XBc32StrictBoundTrap>()
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn xbc32_strict_boundne_trap(
+        &mut self,
+        addr: XReg,
+        bound_ptr: XReg,
+        bound_off: u8,
+    ) -> ControlFlow<Done> {
+        let bound = unsafe { self.load::<usize>(bound_ptr, bound_off.into()) };
+        let addr = self.state[addr].get_u32() as usize;
+        if addr >= bound {
+            self.done_trap::<crate::XBc32StrictBoundNeTrap>()
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn xload8_u32_g32(
+        &mut self,
+        dst: XReg,
+        base: XReg,
+        addr: XReg,
+        offset: u8,
+    ) -> ControlFlow<Done> {
+        let result = unsafe { self.load_g32::<u8>(base, addr, offset) };
+        self.state[dst].set_u32(result.into());
+        ControlFlow::Continue(())
+    }
+
+    fn xload8_s32_g32(
+        &mut self,
+        dst: XReg,
+        base: XReg,
+        addr: XReg,
+        offset: u8,
+    ) -> ControlFlow<Done> {
+        let result = unsafe { self.load_g32::<i8>(base, addr, offset) };
+        self.state[dst].set_i32(result.into());
+        ControlFlow::Continue(())
+    }
+
+    fn xload16le_u32_g32(
+        &mut self,
+        dst: XReg,
+        base: XReg,
+        addr: XReg,
+        offset: u8,
+    ) -> ControlFlow<Done> {
+        let result = unsafe { self.load_g32::<u16>(base, addr, offset) };
+        self.state[dst].set_u32(u16::from_le(result).into());
+        ControlFlow::Continue(())
+    }
+
+    fn xload16le_s32_g32(
+        &mut self,
+        dst: XReg,
+        base: XReg,
+        addr: XReg,
+        offset: u8,
+    ) -> ControlFlow<Done> {
+        let result = unsafe { self.load_g32::<i16>(base, addr, offset) };
+        self.state[dst].set_i32(i16::from_le(result).into());
+        ControlFlow::Continue(())
+    }
+
+    fn xload32le_g32(
+        &mut self,
+        dst: XReg,
+        base: XReg,
+        addr: XReg,
+        offset: u8,
+    ) -> ControlFlow<Done> {
+        let result = unsafe { self.load_g32::<i32>(base, addr, offset) };
+        self.state[dst].set_i32(i32::from_le(result));
+        ControlFlow::Continue(())
+    }
+
+    fn xload64le_g32(
+        &mut self,
+        dst: XReg,
+        base: XReg,
+        addr: XReg,
+        offset: u8,
+    ) -> ControlFlow<Done> {
+        let result = unsafe { self.load_g32::<i64>(base, addr, offset) };
+        self.state[dst].set_i64(i64::from_le(result));
+        ControlFlow::Continue(())
+    }
+
+    fn xstore8_g32(&mut self, base: XReg, addr: XReg, offset: u8, val: XReg) -> ControlFlow<Done> {
+        let val = self.state[val].get_u32() as u8;
+        unsafe {
+            self.store_g32(base, addr, offset, val);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn xstore16le_g32(
+        &mut self,
+        base: XReg,
+        addr: XReg,
+        offset: u8,
+        val: XReg,
+    ) -> ControlFlow<Done> {
+        let val = self.state[val].get_u32() as u16;
+        unsafe {
+            self.store_g32(base, addr, offset, val.to_le());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn xstore32le_g32(
+        &mut self,
+        base: XReg,
+        addr: XReg,
+        offset: u8,
+        val: XReg,
+    ) -> ControlFlow<Done> {
+        let val = self.state[val].get_u32();
+        unsafe {
+            self.store_g32(base, addr, offset, val.to_le());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn xstore64le_g32(
+        &mut self,
+        base: XReg,
+        addr: XReg,
+        offset: u8,
+        val: XReg,
+    ) -> ControlFlow<Done> {
+        let val = self.state[val].get_u64();
+        unsafe {
+            self.store_g32(base, addr, offset, val.to_le());
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -2489,58 +2794,6 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         let b = self.state[operands.src2].get_u64();
         let result = ((u128::from(a) * u128::from(b)) >> 64) as u64;
         self.state[operands.dst].set_u64(result);
-        ControlFlow::Continue(())
-    }
-
-    fn xpush32(&mut self, src: XReg) -> ControlFlow<Done> {
-        self.push::<crate::XPush32, _>(self.state[src].get_u32())?;
-        ControlFlow::Continue(())
-    }
-
-    fn xpush32_many(&mut self, srcs: RegSet<XReg>) -> ControlFlow<Done> {
-        for src in srcs {
-            self.push::<crate::XPush32Many, _>(self.state[src].get_u32())?;
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn xpush64(&mut self, src: XReg) -> ControlFlow<Done> {
-        self.push::<crate::XPush64, _>(self.state[src].get_u64())?;
-        ControlFlow::Continue(())
-    }
-
-    fn xpush64_many(&mut self, srcs: RegSet<XReg>) -> ControlFlow<Done> {
-        for src in srcs {
-            self.push::<crate::XPush64Many, _>(self.state[src].get_u64())?;
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn xpop32(&mut self, dst: XReg) -> ControlFlow<Done> {
-        let val = self.pop();
-        self.state[dst].set_u32(val);
-        ControlFlow::Continue(())
-    }
-
-    fn xpop32_many(&mut self, dsts: RegSet<XReg>) -> ControlFlow<Done> {
-        for dst in dsts.into_iter().rev() {
-            let val = self.pop();
-            self.state[dst].set_u32(val);
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn xpop64(&mut self, dst: XReg) -> ControlFlow<Done> {
-        let val = self.pop();
-        self.state[dst].set_u64(val);
-        ControlFlow::Continue(())
-    }
-
-    fn xpop64_many(&mut self, dsts: RegSet<XReg>) -> ControlFlow<Done> {
-        for dst in dsts.into_iter().rev() {
-            let val = self.pop();
-            self.state[dst].set_u64(val);
-        }
         ControlFlow::Continue(())
     }
 
@@ -3760,6 +4013,30 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    fn vi32x4_from_f32x4_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
+        let a = self.state[src].get_f32x4();
+        self.state[dst].set_i32x4(a.map(|f| f as i32));
+        ControlFlow::Continue(())
+    }
+
+    fn vi32x4_from_f32x4_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
+        let a = self.state[src].get_f32x4();
+        self.state[dst].set_u32x4(a.map(|f| f as u32));
+        ControlFlow::Continue(())
+    }
+
+    fn vi64x2_from_f64x2_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
+        let a = self.state[src].get_f64x2();
+        self.state[dst].set_i64x2(a.map(|f| f as i64));
+        ControlFlow::Continue(())
+    }
+
+    fn vi64x2_from_f64x2_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
+        let a = self.state[src].get_f64x2();
+        self.state[dst].set_u64x2(a.map(|f| f as u64));
+        ControlFlow::Continue(())
+    }
+
     fn vwidenlow8x16_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_i8x16().first_chunk().unwrap();
         self.state[dst].set_i16x8(a.map(|i| i.into()));
@@ -3881,6 +4158,43 @@ impl ExtendedOpVisitor for Interpreter<'_> {
                 .unwrap_or(if *i < 0 { u16::MIN } else { u16::MAX });
         }
         self.state[operands.dst].set_u16x8(result);
+        ControlFlow::Continue(())
+    }
+
+    fn vnarrow64x2_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
+        let a = self.state[operands.src1].get_i64x2();
+        let b = self.state[operands.src2].get_i64x2();
+        let mut result = [0; 4];
+        for (i, d) in a.iter().chain(&b).zip(&mut result) {
+            *d = (*i)
+                .try_into()
+                .unwrap_or(if *i < 0 { i32::MIN } else { i32::MAX });
+        }
+        self.state[operands.dst].set_i32x4(result);
+        ControlFlow::Continue(())
+    }
+
+    fn vnarrow64x2_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
+        let a = self.state[operands.src1].get_i64x2();
+        let b = self.state[operands.src2].get_i64x2();
+        let mut result = [0; 4];
+        for (i, d) in a.iter().chain(&b).zip(&mut result) {
+            *d = (*i)
+                .try_into()
+                .unwrap_or(if *i < 0 { u32::MIN } else { u32::MAX });
+        }
+        self.state[operands.dst].set_u32x4(result);
+        ControlFlow::Continue(())
+    }
+
+    fn vunarrow64x2_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
+        let a = self.state[operands.src1].get_u64x2();
+        let b = self.state[operands.src2].get_u64x2();
+        let mut result = [0; 4];
+        for (i, d) in a.iter().chain(&b).zip(&mut result) {
+            *d = (*i).try_into().unwrap_or(u32::MAX);
+        }
+        self.state[operands.dst].set_u32x4(result);
         ControlFlow::Continue(())
     }
 
@@ -4823,6 +5137,22 @@ impl ExtendedOpVisitor for Interpreter<'_> {
             *a = a.wasm_mul_add(b, c);
         }
         self.state[dst].set_f64x2(a);
+        ControlFlow::Continue(())
+    }
+
+    fn vselect(
+        &mut self,
+        dst: VReg,
+        cond: XReg,
+        if_nonzero: VReg,
+        if_zero: VReg,
+    ) -> ControlFlow<Done> {
+        let result = if self.state[cond].get_u32() != 0 {
+            self.state[if_nonzero]
+        } else {
+            self.state[if_zero]
+        };
+        self.state[dst] = result;
         ControlFlow::Continue(())
     }
 
