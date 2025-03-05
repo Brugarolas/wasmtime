@@ -23,6 +23,12 @@ pub struct HostFunc {
     func: Box<dyn Any + Send + Sync>,
 }
 
+impl core::fmt::Debug for HostFunc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HostFunc").finish_non_exhaustive()
+    }
+}
+
 impl HostFunc {
     pub(crate) fn from_closure<T, F, P, R>(func: F) -> Arc<HostFunc>
     where
@@ -42,6 +48,7 @@ impl HostFunc {
         cx: NonNull<VMOpaqueContext>,
         data: NonNull<u8>,
         ty: u32,
+        _caller_instance: u32,
         flags: NonNull<VMGlobalDefinition>,
         memory: *mut VMMemoryDefinition,
         realloc: *mut VMFuncRef,
@@ -437,6 +444,7 @@ extern "C" fn dynamic_entrypoint<T, F>(
     cx: NonNull<VMOpaqueContext>,
     data: NonNull<u8>,
     ty: u32,
+    _caller_instance: u32,
     flags: NonNull<VMGlobalDefinition>,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,

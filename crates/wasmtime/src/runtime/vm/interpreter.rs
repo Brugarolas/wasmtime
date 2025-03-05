@@ -175,6 +175,7 @@ impl InterpreterRef<'_> {
                         TrapKind::IntegerOverflow => Trap::IntegerOverflow,
                         TrapKind::DivideByZero => Trap::IntegerDivisionByZero,
                         TrapKind::BadConversionToInteger => Trap::BadConversionToInteger,
+                        TrapKind::MemoryOutOfBounds => Trap::MemoryOutOfBounds,
                     };
                     s.set_jit_trap(regs, None, trap);
                 }
@@ -378,16 +379,18 @@ impl InterpreterRef<'_> {
             use wasmtime_environ::component::ComponentBuiltinFunctionIndex;
 
             if id == const { HostCall::ComponentLowerImport.index() } {
-                call!(@host VMLoweringCallee(nonnull, nonnull, u32, nonnull, ptr, ptr, u8, u8, nonnull, size) -> bool);
+                call!(@host VMLoweringCallee(nonnull, nonnull, u32, u32, nonnull, ptr, ptr, u8, u8, nonnull, size) -> bool);
             }
 
             macro_rules! component {
                 (
                     $(
+                        $( #[cfg($attr:meta)] )?
                         $name:ident($($pname:ident: $param:ident ),* ) $(-> $result:ident)?;
                     )*
                 ) => {
                     $(
+                        $( #[cfg($attr)] )?
                         if id == const { HostCall::ComponentBuiltin(ComponentBuiltinFunctionIndex::$name()).index() } {
                             call!(@builtin($($param),*) $(-> $result)?);
                         }

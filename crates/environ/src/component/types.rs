@@ -1,5 +1,5 @@
 use crate::component::{MAX_FLAT_PARAMS, MAX_FLAT_RESULTS};
-use crate::prelude::*;
+use crate::{prelude::*, TypeTrace};
 use crate::{EntityType, ModuleInternedTypeIndex, ModuleTypes, PrimaryMap};
 use core::hash::{Hash, Hasher};
 use core::ops::Index;
@@ -91,13 +91,16 @@ indices! {
     pub struct TypeListIndex(u32);
     /// Index pointing to a future type in the component model.
     pub struct TypeFutureIndex(u32);
+
     /// Index pointing to a future table within a component.
     ///
     /// This is analogous to `TypeResourceTableIndex` in that it tracks
     /// ownership of futures within each (sub)component instance.
     pub struct TypeFutureTableIndex(u32);
+
     /// Index pointing to a stream type in the component model.
     pub struct TypeStreamIndex(u32);
+
     /// Index pointing to a stream table within a component.
     ///
     /// This is analogous to `TypeResourceTableIndex` in that it tracks
@@ -116,9 +119,6 @@ indices! {
     /// the global state table for error contexts at the level of the entire component,
     /// not just a subcomponent.
     pub struct TypeComponentGlobalErrorContextTableIndex(u32);
-
-    /// Index pointing to an interned `task.return` type within a component.
-    pub struct TypeTaskReturnIndex(u32);
 
     /// Index pointing to a resource table within a component.
     ///
@@ -277,13 +277,45 @@ pub struct ComponentTypes {
     pub(super) stream_tables: PrimaryMap<TypeStreamTableIndex, TypeStreamTable>,
     pub(super) error_context_tables:
         PrimaryMap<TypeComponentLocalErrorContextTableIndex, TypeErrorContextTable>,
-    pub(super) task_returns: PrimaryMap<TypeTaskReturnIndex, TypeTaskReturn>,
+}
+
+impl TypeTrace for ComponentTypes {
+    fn trace<F, E>(&self, func: &mut F) -> Result<(), E>
+    where
+        F: FnMut(crate::EngineOrModuleTypeIndex) -> Result<(), E>,
+    {
+        for (_, m) in &self.modules {
+            m.trace(func)?;
+        }
+        if let Some(m) = self.module_types.as_ref() {
+            m.trace(func)?;
+        }
+        Ok(())
+    }
+
+    fn trace_mut<F, E>(&mut self, func: &mut F) -> Result<(), E>
+    where
+        F: FnMut(&mut crate::EngineOrModuleTypeIndex) -> Result<(), E>,
+    {
+        for (_, m) in &mut self.modules {
+            m.trace_mut(func)?;
+        }
+        if let Some(m) = self.module_types.as_mut() {
+            m.trace_mut(func)?;
+        }
+        Ok(())
+    }
 }
 
 impl ComponentTypes {
     /// Returns the core wasm module types known within this component.
     pub fn module_types(&self) -> &ModuleTypes {
         self.module_types.as_ref().unwrap()
+    }
+
+    /// Returns the core wasm module types known within this component.
+    pub fn module_types_mut(&mut self) -> &mut ModuleTypes {
+        self.module_types.as_mut().unwrap()
     }
 
     /// Returns the canonical ABI information about the specified type.
@@ -449,6 +481,34 @@ pub struct TypeModule {
     pub exports: IndexMap<String, EntityType>,
 }
 
+impl TypeTrace for TypeModule {
+    fn trace<F, E>(&self, func: &mut F) -> Result<(), E>
+    where
+        F: FnMut(crate::EngineOrModuleTypeIndex) -> Result<(), E>,
+    {
+        for ty in self.imports.values() {
+            ty.trace(func)?;
+        }
+        for ty in self.exports.values() {
+            ty.trace(func)?;
+        }
+        Ok(())
+    }
+
+    fn trace_mut<F, E>(&mut self, func: &mut F) -> Result<(), E>
+    where
+        F: FnMut(&mut crate::EngineOrModuleTypeIndex) -> Result<(), E>,
+    {
+        for ty in self.imports.values_mut() {
+            ty.trace_mut(func)?;
+        }
+        for ty in self.exports.values_mut() {
+            ty.trace_mut(func)?;
+        }
+        Ok(())
+    }
+}
+
 /// The type of a component in the component model.
 #[derive(Serialize, Deserialize, Default)]
 pub struct TypeComponent {
@@ -477,20 +537,6 @@ pub struct TypeFunc {
     pub params: TypeTupleIndex,
     /// Results of the function represented as a tuple.
     pub results: TypeTupleIndex,
-    /// Expected core func type for memory32 `task.return` calls for this function.
-    pub task_return_type32: TypeTaskReturnIndex,
-    /// Expected core func type for memory64 `task.return` calls for this function.
-    pub task_return_type64: TypeTaskReturnIndex,
-}
-
-/// A core type representing the expected `task.return` signature for a
-/// component function.
-#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
-pub struct TypeTaskReturn {
-    /// Core type parameters for the signature.
-    ///
-    /// Note that `task.return` never returns results.
-    pub params: Vec<FlatType>,
 }
 
 /// All possible interface types that values can have.
@@ -598,7 +644,7 @@ const fn max(a: u32, b: u32) -> u32 {
 
 impl CanonicalAbiInfo {
     /// ABI information for zero-sized types.
-    const ZERO: CanonicalAbiInfo = CanonicalAbiInfo {
+    pub const ZERO: CanonicalAbiInfo = CanonicalAbiInfo {
         size32: 0,
         align32: 1,
         size64: 0,

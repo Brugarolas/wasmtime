@@ -3,10 +3,10 @@
 // Pull in the ISLE generated code.
 pub(crate) mod generated_code;
 use crate::{ir::types, ir::AtomicRmwOp, isa};
-use generated_code::{Context, MInst, RegisterClass};
+use generated_code::{AssemblerOutputs, Context, MInst, RegisterClass};
 
 // Types that the generated ISLE code uses via `use super::*`.
-use super::external::{CraneliftRegisters, PairedGpr};
+use super::external::{CraneliftRegisters, PairedGpr, PairedXmm};
 use super::{is_int_or_ref_ty, is_mergeable_load, lower_to_amode, MergeableLoadSize};
 use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::ir::immediates::*;
@@ -41,14 +41,7 @@ type BoxSyntheticAmode = Box<SyntheticAmode>;
 
 /// When interacting with the external assembler (see `external.rs`), we
 /// need to fix the types we'll use.
-type AssemblerReadGpr = asm::Gpr<Gpr>;
-type AssemblerReadWriteGpr = asm::Gpr<PairedGpr>;
-type AssemblerReadGprMem = asm::GprMem<Gpr, Gpr>;
-type AssemblerReadWriteGprMem = asm::GprMem<PairedGpr, Gpr>;
 type AssemblerInst = asm::Inst<CraneliftRegisters>;
-type AssemblerImm8 = asm::Imm8;
-type AssemblerImm16 = asm::Imm16;
-type AssemblerImm32 = asm::Imm32;
 
 pub struct SinkableLoad {
     inst: Inst,
@@ -959,107 +952,74 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     ///// External assembler methods.
     ////////////////////////////////////////////////////////////////////////////
 
-    fn is_imm8(&mut self, src: &GprMemImm) -> Option<AssemblerImm8> {
+    fn is_imm8(&mut self, src: &GprMemImm) -> Option<u8> {
         match src.clone().to_reg_mem_imm() {
-            RegMemImm::Imm { simm32 } => {
-                // TODO fix down-convert logic: if an assembly instruction can
-                // only fit 8 bits, we check if down-converting the 32 bits from
-                // CLIF we have here will fit. Some assembler instructions will
-                // sign-extend this immediate, however, and we don't have a way
-                // to distinguish this yet. For a CLIF value `-2i8`, this
-                // conversion will both pass on the appropriate bytes and the
-                // emitted instruction will sign-extend them as expected. But,
-                // for a CLIF value `254u8` (the same bit pattern), we could
-                // pass on the right bits but the sign-extension will break
-                // Cranelift's semantics. For the time being, we conservatively
-                // only allow down-converting to `i8` values, meaning some valid
-                // constants will be rejected.
-                let imm = i8::try_from(simm32).ok()?;
-                Some(AssemblerImm8::new(imm as u8))
-            }
+            RegMemImm::Imm { simm32 } => Some(u8::try_from(simm32).ok()?),
             _ => None,
         }
     }
 
-    fn is_imm16(&mut self, src: &GprMemImm) -> Option<AssemblerImm16> {
+    fn is_simm8(&mut self, src: &GprMemImm) -> Option<i8> {
         match src.clone().to_reg_mem_imm() {
-            RegMemImm::Imm { simm32 } => {
-                // TODO fix down-convert logic: see notes in `is_imm8`.
-                let imm = i16::try_from(simm32).ok()?;
-                Some(AssemblerImm16::new(imm as u16))
-            }
-            _ => None,
-        }
-    }
-    fn is_imm32(&mut self, src: &GprMemImm) -> Option<AssemblerImm32> {
-        match src.clone().to_reg_mem_imm() {
-            RegMemImm::Imm { simm32 } => Some(AssemblerImm32::new(simm32)),
+            RegMemImm::Imm { simm32 } => Some(i8::try_from(simm32).ok()?),
             _ => None,
         }
     }
 
-    fn is_gpr(&mut self, src: &GprMemImm) -> Option<AssemblerReadGprMem> {
+    fn is_imm16(&mut self, src: &GprMemImm) -> Option<u16> {
         match src.clone().to_reg_mem_imm() {
-            RegMemImm::Reg { reg } => {
-                let read = Gpr::new(reg).unwrap();
-                Some(AssemblerReadGprMem::Gpr(read))
-            }
+            RegMemImm::Imm { simm32 } => Some(u16::try_from(simm32).ok()?),
             _ => None,
         }
     }
 
-    fn is_mem(&mut self, src: &GprMemImm) -> Option<AssemblerReadGprMem> {
+    fn is_simm16(&mut self, src: &GprMemImm) -> Option<i16> {
         match src.clone().to_reg_mem_imm() {
-            RegMemImm::Mem { addr } => {
-                let addr = addr.into();
-                Some(AssemblerReadGprMem::Mem(addr))
-            }
+            RegMemImm::Imm { simm32 } => Some(i16::try_from(simm32).ok()?),
             _ => None,
         }
     }
 
-    fn is_gpr_mem(&mut self, src: &GprMemImm) -> Option<AssemblerReadGprMem> {
+    fn is_imm32(&mut self, src: &GprMemImm) -> Option<u32> {
         match src.clone().to_reg_mem_imm() {
-            RegMemImm::Reg { reg } => {
-                let read = Gpr::new(reg).unwrap();
-                Some(AssemblerReadGprMem::Gpr(read))
-            }
-            RegMemImm::Mem { addr } => {
-                let addr = addr.into();
-                Some(AssemblerReadGprMem::Mem(addr))
-            }
+            RegMemImm::Imm { simm32 } => Some(simm32),
             _ => None,
         }
     }
 
-    fn convert_gpr_to_assembler_read_write_gpr(&mut self, read: Gpr) -> AssemblerReadWriteGpr {
-        let write = self.lower_ctx.alloc_tmp(types::I64).only_reg().unwrap();
-        let write = WritableGpr::from_writable_reg(write).unwrap();
-        AssemblerReadWriteGpr::new(PairedGpr { read, write })
+    fn is_simm32(&mut self, src: &GprMemImm) -> Option<i32> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Imm { simm32 } => Some(simm32 as i32),
+            _ => None,
+        }
     }
 
-    fn convert_assembler_read_write_gpr_to_gpr(&mut self, gpr: &AssemblerReadWriteGpr) -> Gpr {
-        gpr.as_ref().write.to_reg()
+    fn is_gpr(&mut self, src: &GprMemImm) -> Option<Gpr> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Reg { reg } => Gpr::new(reg),
+            _ => None,
+        }
     }
 
-    fn convert_gpr_to_assembler_read_write_gpr_mem(
-        &mut self,
-        read: Gpr,
-    ) -> AssemblerReadWriteGprMem {
-        let write = self.lower_ctx.alloc_tmp(types::I64).only_reg().unwrap();
-        let write = WritableGpr::from_writable_reg(write).unwrap();
-        AssemblerReadWriteGprMem::Gpr(PairedGpr { read, write })
+    fn is_xmm(&mut self, src: &XmmMem) -> Option<Xmm> {
+        match src.clone().to_reg_mem() {
+            RegMem::Reg { reg } => Xmm::new(reg),
+            _ => None,
+        }
     }
 
-    fn convert_assembler_read_write_gpr_mem_to_gpr(
-        &mut self,
-        reg_mem: &AssemblerReadWriteGprMem,
-    ) -> Gpr {
-        match reg_mem {
-            asm::GprMem::Gpr(gpr) => gpr.write.to_reg(),
-            asm::GprMem::Mem(_) => {
-                unimplemented!("cannot convert a memory address to a GPR; check the ISLE rules")
-            }
+    fn is_gpr_mem(&mut self, src: &GprMemImm) -> Option<GprMem> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Reg { reg } => GprMem::new(RegMem::Reg { reg }),
+            RegMemImm::Mem { addr } => GprMem::new(RegMem::Mem { addr }),
+            _ => None,
+        }
+    }
+
+    fn is_xmm_mem(&mut self, src: &XmmMem) -> Option<XmmMem> {
+        match src.clone().to_reg_mem() {
+            RegMem::Reg { reg } => XmmMem::new(RegMem::Reg { reg }),
+            RegMem::Mem { addr } => XmmMem::new(RegMem::Mem { addr }),
         }
     }
 }
@@ -1073,6 +1033,51 @@ impl IsleContext<'_, '_, MInst, X64Backend> {
             dst: Writable::from_reg(Xmm::unwrap_new(tmp.to_reg())),
         });
         Xmm::unwrap_new(tmp.to_reg())
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_gpr_to_assembler_read_write_gpr(&mut self, read: Gpr) -> asm::Gpr<PairedGpr> {
+        let write = self.lower_ctx.alloc_tmp(types::I64).only_reg().unwrap();
+        let write = WritableGpr::from_writable_reg(write).unwrap();
+        asm::Gpr::new(PairedGpr { read, write })
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_xmm_to_assembler_read_write_xmm(&mut self, read: Xmm) -> asm::Xmm<PairedXmm> {
+        let write = self.lower_ctx.alloc_tmp(types::F32X4).only_reg().unwrap();
+        let write = WritableXmm::from_writable_reg(write).unwrap();
+        asm::Xmm::new(PairedXmm { read, write })
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_gpr_mem_to_assembler_read_gpr_mem(&self, read: &GprMem) -> asm::GprMem<Gpr, Gpr> {
+        match read.clone().into() {
+            RegMem::Reg { reg } => asm::GprMem::Gpr(Gpr::new(reg).unwrap()),
+            RegMem::Mem { addr } => asm::GprMem::Mem(addr.into()),
+        }
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_xmm_mem_to_assembler_read_xmm_mem(&self, read: &XmmMem) -> asm::XmmMem<Xmm, Gpr> {
+        match read.clone().into() {
+            RegMem::Reg { reg } => asm::XmmMem::Xmm(Xmm::new(reg).unwrap()),
+            RegMem::Mem { addr } => asm::XmmMem::Mem(addr.into()),
+        }
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_gpr_mem_to_assembler_read_write_gpr_mem(
+        &mut self,
+        read: &GprMem,
+    ) -> asm::GprMem<PairedGpr, Gpr> {
+        match read.clone().into() {
+            RegMem::Reg { reg } => asm::GprMem::Gpr(
+                *self
+                    .convert_gpr_to_assembler_read_write_gpr(Gpr::new(reg).unwrap())
+                    .as_ref(),
+            ),
+            RegMem::Mem { addr } => asm::GprMem::Mem(addr.into()),
+        }
     }
 }
 

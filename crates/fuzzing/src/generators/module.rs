@@ -15,7 +15,6 @@ pub struct ModuleConfig {
     // in our `*.wast` testing so keep knobs here so they can be read during
     // config-to-`wasmtime::Config` translation.
     pub function_references_enabled: bool,
-    pub component_model_more_flags: bool,
     pub component_model_async: bool,
 }
 
@@ -23,7 +22,7 @@ impl<'a> Arbitrary<'a> for ModuleConfig {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<ModuleConfig> {
         let mut config = wasm_smith::Config::arbitrary(u)?;
 
-        // This list is intended to be the definintive source of truth for
+        // This list is intended to be the definitive source of truth for
         // what's at least possible to fuzz within Wasmtime. This is a
         // combination of features in `wasm-smith` where some proposals are
         // on-by-default (as determined by fuzz input) and others are
@@ -62,7 +61,6 @@ impl<'a> Arbitrary<'a> for ModuleConfig {
         config.disallow_traps = u.ratio(9, 10)?;
 
         Ok(ModuleConfig {
-            component_model_more_flags: false,
             component_model_async: false,
             function_references_enabled: config.gc_enabled,
             config,

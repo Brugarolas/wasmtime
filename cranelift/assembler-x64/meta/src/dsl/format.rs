@@ -194,12 +194,14 @@ impl From<Location> for Operand {
 
 /// An operand location, as expressed in Intel's _Instruction Set Reference_.
 #[derive(Clone, Copy, Debug)]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, reason = "makes DSL definitions easier to read")]
 pub enum Location {
     al,
     ax,
     eax,
     rax,
+
+    cl,
 
     imm8,
     imm16,
@@ -210,10 +212,13 @@ pub enum Location {
     r32,
     r64,
 
+    xmm,
+
     rm8,
     rm16,
     rm32,
     rm64,
+    rm128,
 }
 
 impl Location {
@@ -222,10 +227,11 @@ impl Location {
     pub fn bits(&self) -> u8 {
         use Location::*;
         match self {
-            al | imm8 | r8 | rm8 => 8,
+            al | cl | imm8 | r8 | rm8 => 8,
             ax | imm16 | r16 | rm16 => 16,
             eax | imm32 | r32 | rm32 => 32,
             rax | r64 | rm64 => 64,
+            xmm | rm128 => 128,
         }
     }
 
@@ -240,8 +246,8 @@ impl Location {
     pub fn uses_memory(&self) -> bool {
         use Location::*;
         match self {
-            al | ax | eax | rax | imm8 | imm16 | imm32 | r8 | r16 | r32 | r64 => false,
-            rm8 | rm16 | rm32 | rm64 => true,
+            al | cl | ax | eax | rax | imm8 | imm16 | imm32 | r8 | r16 | r32 | r64 | xmm => false,
+            rm8 | rm16 | rm32 | rm64 | rm128 => true,
         }
     }
 
@@ -251,8 +257,8 @@ impl Location {
     pub fn uses_variable_register(&self) -> bool {
         use Location::*;
         match self {
-            al | ax | eax | rax | imm8 | imm16 | imm32 => false,
-            r8 | r16 | r32 | r64 | rm8 | rm16 | rm32 | rm64 => true,
+            al | ax | eax | rax | cl | imm8 | imm16 | imm32 => false,
+            r8 | r16 | r32 | r64 | xmm | rm8 | rm16 | rm32 | rm64 | rm128 => true,
         }
     }
 
@@ -261,10 +267,10 @@ impl Location {
     pub fn kind(&self) -> OperandKind {
         use Location::*;
         match self {
-            al | ax | eax | rax => OperandKind::FixedReg(*self),
+            al | ax | eax | rax | cl => OperandKind::FixedReg(*self),
             imm8 | imm16 | imm32 => OperandKind::Imm(*self),
-            r8 | r16 | r32 | r64 => OperandKind::Reg(*self),
-            rm8 | rm16 | rm32 | rm64 => OperandKind::RegMem(*self),
+            r8 | r16 | r32 | r64 | xmm => OperandKind::Reg(*self),
+            rm8 | rm16 | rm32 | rm64 | rm128 => OperandKind::RegMem(*self),
         }
     }
 }
@@ -278,6 +284,8 @@ impl core::fmt::Display for Location {
             eax => write!(f, "eax"),
             rax => write!(f, "rax"),
 
+            cl => write!(f, "cl"),
+
             imm8 => write!(f, "imm8"),
             imm16 => write!(f, "imm16"),
             imm32 => write!(f, "imm32"),
@@ -287,10 +295,13 @@ impl core::fmt::Display for Location {
             r32 => write!(f, "r32"),
             r64 => write!(f, "r64"),
 
+            xmm => write!(f, "xmm"),
+
             rm8 => write!(f, "rm8"),
             rm16 => write!(f, "rm16"),
             rm32 => write!(f, "rm32"),
             rm64 => write!(f, "rm64"),
+            rm128 => write!(f, "rm128"),
         }
     }
 }
@@ -322,6 +333,27 @@ pub enum Mutability {
     ReadWrite,
 }
 
+impl Mutability {
+    /// Returns whether this represents a read of the operand in question.
+    ///
+    /// Note that for read/write operands this returns `true`.
+    pub fn is_read(&self) -> bool {
+        match self {
+            Mutability::Read | Mutability::ReadWrite => true,
+        }
+    }
+
+    /// Returns whether this represents a write of the operand in question.
+    ///
+    /// Note that for read/write operands this returns `true`.
+    pub fn is_write(&self) -> bool {
+        match self {
+            Mutability::Read => false,
+            Mutability::ReadWrite => true,
+        }
+    }
+}
+
 impl Default for Mutability {
     fn default() -> Self {
         Self::Read
@@ -349,7 +381,14 @@ pub enum Extension {
     SignExtendQuad,
     SignExtendLong,
     SignExtendWord,
-    ZeroExtend,
+}
+
+impl Extension {
+    /// Check if the extension is sign-extended.
+    #[must_use]
+    pub fn is_sign_extended(&self) -> bool {
+        matches!(self, Self::SignExtendQuad | Self::SignExtendLong | Self::SignExtendWord)
+    }
 }
 
 impl Default for Extension {
@@ -365,7 +404,6 @@ impl core::fmt::Display for Extension {
             Extension::SignExtendQuad => write!(f, "sxq"),
             Extension::SignExtendLong => write!(f, "sxl"),
             Extension::SignExtendWord => write!(f, "sxw"),
-            Extension::ZeroExtend => write!(f, "zx"),
         }
     }
 }

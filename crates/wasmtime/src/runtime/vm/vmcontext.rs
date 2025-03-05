@@ -263,6 +263,39 @@ mod test_vmglobal_import {
     }
 }
 
+/// The fields compiled code needs to access to utilize a WebAssembly
+/// tag imported from another instance.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct VMTagImport {
+    /// A pointer to the imported tag description.
+    pub from: VmPtr<VMTagDefinition>,
+}
+
+// SAFETY: the above structure is repr(C) and only contains `VmSafe` fields.
+unsafe impl VmSafe for VMTagImport {}
+
+#[cfg(test)]
+mod test_vmtag_import {
+    use super::VMTagImport;
+    use core::mem::{offset_of, size_of};
+    use wasmtime_environ::{HostPtr, Module, VMOffsets};
+
+    #[test]
+    fn check_vmtag_import_offsets() {
+        let module = Module::new();
+        let offsets = VMOffsets::new(HostPtr, &module);
+        assert_eq!(
+            size_of::<VMTagImport>(),
+            usize::from(offsets.size_of_vmtag_import())
+        );
+        assert_eq!(
+            offset_of!(VMTagImport, from),
+            usize::from(offsets.vmtag_import_from())
+        );
+    }
+}
+
 /// The fields compiled code needs to access to utilize a WebAssembly linear
 /// memory defined within the instance, namely the start address and the
 /// size in bytes.
@@ -467,6 +500,7 @@ impl VMGlobalDefinition {
                     global.init_gc_ref(store.gc_store_mut()?, r.as_ref())
                 }
                 WasmHeapTopType::Func => *global.as_func_ref_mut() = raw.get_funcref().cast(),
+                WasmHeapTopType::Cont => todo!(), // FIXME: #10248 stack switching support.
             },
         }
         Ok(global)
@@ -500,6 +534,7 @@ impl VMGlobalDefinition {
                     }
                 }),
                 WasmHeapTopType::Func => ValRaw::funcref(self.as_func_ref().cast()),
+                WasmHeapTopType::Cont => todo!(), // FIXME: #10248 stack switching support.
             },
         })
     }
@@ -666,6 +701,49 @@ mod test_vmshared_type_index {
             size_of::<VMSharedTypeIndex>(),
             usize::from(offsets.size_of_vmshared_type_index())
         );
+    }
+}
+
+/// A WebAssembly tag defined within the instance.
+///
+#[derive(Debug)]
+#[repr(C)]
+pub struct VMTagDefinition {
+    /// Function signature's type id.
+    pub type_index: VMSharedTypeIndex,
+}
+
+impl VMTagDefinition {
+    pub fn new(type_index: VMSharedTypeIndex) -> Self {
+        Self { type_index }
+    }
+}
+
+// SAFETY: the above structure is repr(C) and only contains VmSafe
+// fields.
+unsafe impl VmSafe for VMTagDefinition {}
+
+#[cfg(test)]
+mod test_vmtag_definition {
+    use super::VMTagDefinition;
+    use std::mem::size_of;
+    use wasmtime_environ::{HostPtr, Module, PtrSize, VMOffsets};
+
+    #[test]
+    fn check_vmtag_definition_offsets() {
+        let module = Module::new();
+        let offsets = VMOffsets::new(HostPtr, &module);
+        assert_eq!(
+            size_of::<VMTagDefinition>(),
+            usize::from(offsets.ptr.size_of_vmtag_definition())
+        );
+    }
+
+    #[test]
+    fn check_vmtag_begins_aligned() {
+        let module = Module::new();
+        let offsets = VMOffsets::new(HostPtr, &module);
+        assert_eq!(offsets.vmctx_tags_begin() % 16, 0);
     }
 }
 
@@ -897,10 +975,17 @@ const _: () = {
     )
 };
 
-/// Structure used to control interrupting wasm code.
+/// Structure that holds all mutable context that is shared across all instances
+/// in a store, for example data related to fuel or epochs.
+///
+/// `VMStoreContext`s are one-to-one with `wasmtime::Store`s, the same way that
+/// `VMContext`s are one-to-one with `wasmtime::Instance`s. And the same way
+/// that multiple `wasmtime::Instance`s may be associated with the same
+/// `wasmtime::Store`, multiple `VMContext`s hold a pointer to the same
+/// `VMStoreContext` when they are associated with the same `wasmtime::Store`.
 #[derive(Debug)]
 #[repr(C)]
-pub struct VMRuntimeLimits {
+pub struct VMStoreContext {
     // NB: 64-bit integer fields are located first with pointer-sized fields
     // trailing afterwards. That makes the offsets in this structure easier to
     // calculate on 32-bit platforms as we don't have to worry about the
@@ -968,19 +1053,19 @@ pub struct VMRuntimeLimits {
     pub last_wasm_entry_fp: UnsafeCell<usize>,
 }
 
-// The `VMRuntimeLimits` type is a pod-type with no destructor, and we don't
+// The `VMStoreContext` type is a pod-type with no destructor, and we don't
 // access any fields from other threads, so add in these trait impls which are
 // otherwise not available due to the `fuel_consumed` and `epoch_deadline`
-// variables in `VMRuntimeLimits`.
-unsafe impl Send for VMRuntimeLimits {}
-unsafe impl Sync for VMRuntimeLimits {}
+// variables in `VMStoreContext`.
+unsafe impl Send for VMStoreContext {}
+unsafe impl Sync for VMStoreContext {}
 
 // SAFETY: the above structure is repr(C) and only contains `VmSafe` fields.
-unsafe impl VmSafe for VMRuntimeLimits {}
+unsafe impl VmSafe for VMStoreContext {}
 
-impl Default for VMRuntimeLimits {
-    fn default() -> VMRuntimeLimits {
-        VMRuntimeLimits {
+impl Default for VMStoreContext {
+    fn default() -> VMStoreContext {
+        VMStoreContext {
             stack_limit: UnsafeCell::new(usize::max_value()),
             fuel_consumed: UnsafeCell::new(0),
             epoch_deadline: UnsafeCell::new(0),
@@ -992,8 +1077,8 @@ impl Default for VMRuntimeLimits {
 }
 
 #[cfg(test)]
-mod test_vmruntime_limits {
-    use super::VMRuntimeLimits;
+mod test_vmstore_context {
+    use super::VMStoreContext;
     use core::mem::offset_of;
     use wasmtime_environ::{HostPtr, Module, PtrSize, VMOffsets};
 
@@ -1002,28 +1087,28 @@ mod test_vmruntime_limits {
         let module = Module::new();
         let offsets = VMOffsets::new(HostPtr, &module);
         assert_eq!(
-            offset_of!(VMRuntimeLimits, stack_limit),
-            usize::from(offsets.ptr.vmruntime_limits_stack_limit())
+            offset_of!(VMStoreContext, stack_limit),
+            usize::from(offsets.ptr.vmstore_context_stack_limit())
         );
         assert_eq!(
-            offset_of!(VMRuntimeLimits, fuel_consumed),
-            usize::from(offsets.ptr.vmruntime_limits_fuel_consumed())
+            offset_of!(VMStoreContext, fuel_consumed),
+            usize::from(offsets.ptr.vmstore_context_fuel_consumed())
         );
         assert_eq!(
-            offset_of!(VMRuntimeLimits, epoch_deadline),
-            usize::from(offsets.ptr.vmruntime_limits_epoch_deadline())
+            offset_of!(VMStoreContext, epoch_deadline),
+            usize::from(offsets.ptr.vmstore_context_epoch_deadline())
         );
         assert_eq!(
-            offset_of!(VMRuntimeLimits, last_wasm_exit_fp),
-            usize::from(offsets.ptr.vmruntime_limits_last_wasm_exit_fp())
+            offset_of!(VMStoreContext, last_wasm_exit_fp),
+            usize::from(offsets.ptr.vmstore_context_last_wasm_exit_fp())
         );
         assert_eq!(
-            offset_of!(VMRuntimeLimits, last_wasm_exit_pc),
-            usize::from(offsets.ptr.vmruntime_limits_last_wasm_exit_pc())
+            offset_of!(VMStoreContext, last_wasm_exit_pc),
+            usize::from(offsets.ptr.vmstore_context_last_wasm_exit_pc())
         );
         assert_eq!(
-            offset_of!(VMRuntimeLimits, last_wasm_entry_fp),
-            usize::from(offsets.ptr.vmruntime_limits_last_wasm_entry_fp())
+            offset_of!(VMStoreContext, last_wasm_entry_fp),
+            usize::from(offsets.ptr.vmstore_context_last_wasm_entry_fp())
         );
     }
 }

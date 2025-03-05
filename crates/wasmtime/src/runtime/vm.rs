@@ -14,9 +14,11 @@ use core::ops::DerefMut;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime_environ::{
-    DefinedFuncIndex, DefinedMemoryIndex, HostPtr, ModuleInternedTypeIndex, VMOffsets,
-    VMSharedTypeIndex,
+    DefinedFuncIndex, DefinedMemoryIndex, HostPtr, VMOffsets, VMSharedTypeIndex,
 };
+
+#[cfg(feature = "gc")]
+use wasmtime_environ::ModuleInternedTypeIndex;
 
 #[cfg(has_host_compiler_backend)]
 mod arch;
@@ -91,7 +93,7 @@ pub use crate::runtime::vm::unwind::*;
 pub use crate::runtime::vm::vmcontext::{
     VMArrayCallFunction, VMArrayCallHostFuncContext, VMContext, VMFuncRef, VMFunctionBody,
     VMFunctionImport, VMGlobalDefinition, VMGlobalImport, VMMemoryDefinition, VMMemoryImport,
-    VMOpaqueContext, VMRuntimeLimits, VMTableImport, VMWasmCallFunction, ValRaw,
+    VMOpaqueContext, VMStoreContext, VMTableImport, VMTagImport, VMWasmCallFunction, ValRaw,
 };
 pub use send_sync_ptr::SendSyncPtr;
 
@@ -201,6 +203,11 @@ pub unsafe trait VMStore {
     /// Metadata required for resources for the component model.
     #[cfg(feature = "component-model")]
     fn component_calls(&mut self) -> &mut component::CallContexts;
+
+    #[cfg(feature = "component-model-async")]
+    fn component_async_store(
+        &mut self,
+    ) -> &mut dyn crate::runtime::component::VMComponentAsyncStore;
 }
 
 impl Deref for dyn VMStore + '_ {
@@ -233,7 +240,7 @@ impl DerefMut for dyn VMStore + '_ {
 /// usage of `Instance` and `ComponentInstance` for example.
 #[derive(Copy, Clone)]
 #[repr(transparent)]
-struct VMStoreRawPtr(NonNull<dyn VMStore>);
+struct VMStoreRawPtr(pub NonNull<dyn VMStore>);
 
 // SAFETY: this is the purpose of `VMStoreRawPtr`, see docs above about safe
 // usage.
@@ -296,6 +303,7 @@ impl ModuleRuntimeInfo {
 
     /// Translate a module-level interned type index into an engine-level
     /// interned type index.
+    #[cfg(feature = "gc")]
     fn engine_type_index(&self, module_index: ModuleInternedTypeIndex) -> VMSharedTypeIndex {
         match self {
             ModuleRuntimeInfo::Module(m) => m

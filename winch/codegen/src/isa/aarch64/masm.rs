@@ -9,16 +9,18 @@ use crate::{
     abi::{self, align_to, calculate_frame_adjustment, local::LocalSlot, vmctx},
     codegen::{ptr_type_from_ptr_size, CodeGenContext, CodeGenError, Emission, FuncEnv},
     isa::{
+        aarch64::abi::SHADOW_STACK_POINTER_SLOT_SIZE,
         reg::{writable, Reg, WritableReg},
         CallingConvention,
     },
     masm::{
-        CalleeKind, DivKind, Extend, ExtendKind, ExtractLaneKind, FloatCmpKind, HandleOverflowKind,
-        Imm as I, IntCmpKind, LoadKind, MacroAssembler as Masm, MulWideKind, OperandSize, RegImm,
-        RemKind, ReplaceLaneKind, RmwOp, RoundingMode, SPOffset, ShiftKind, SplatKind, StackSlot,
-        StoreKind, TrapCode, TruncKind, V128AbsKind, V128ConvertKind, V128ExtendKind,
-        V128NarrowKind, VectorCompareKind, VectorEqualityKind, Zero, TRUSTED_FLAGS,
-        UNTRUSTED_FLAGS,
+        CalleeKind, DivKind, Extend, ExtendKind, ExtractLaneKind, FloatCmpKind, Imm as I,
+        IntCmpKind, LoadKind, MacroAssembler as Masm, MulWideKind, OperandSize, RegImm, RemKind,
+        ReplaceLaneKind, RmwOp, RoundingMode, SPOffset, ShiftKind, SplatKind, StackSlot, StoreKind,
+        TrapCode, TruncKind, V128AbsKind, V128AddKind, V128ConvertKind, V128ExtAddKind,
+        V128ExtMulKind, V128ExtendKind, V128MaxKind, V128MinKind, V128MulKind, V128NarrowKind,
+        V128NegKind, V128SubKind, V128TruncKind, VectorCompareKind, VectorEqualityKind, Zero,
+        TRUSTED_FLAGS, UNTRUSTED_FLAGS,
     },
     stack::TypedReg,
 };
@@ -64,7 +66,7 @@ impl MacroAssembler {
     {
         let mut aligned = false;
         let alignment: u32 = <Aarch64ABI as ABI>::call_stack_align().into();
-        let addend: u32 = <Aarch64ABI as ABI>::arg_base_offset().into();
+        let addend: u32 = <Aarch64ABI as ABI>::initial_frame_size().into();
         let delta = calculate_frame_adjustment(self.sp_offset()?.as_u32(), addend, alignment);
         if delta != 0 {
             self.asm.sub_ir(
@@ -105,10 +107,15 @@ impl Masm for MacroAssembler {
         let lr = regs::lr();
         let fp = regs::fp();
         let sp = regs::sp();
-        let addr = Address::pre_indexed_from_sp(-16);
 
+        let addr = Address::pre_indexed_from_sp(-16);
         self.asm.stp(fp, lr, addr);
         self.asm.mov_rr(sp, writable!(fp), OperandSize::S64);
+
+        let addr = Address::pre_indexed_from_sp(-(SHADOW_STACK_POINTER_SLOT_SIZE as i64));
+        self.asm
+            .str(regs::shadow_sp(), addr, OperandSize::S64, TRUSTED_FLAGS);
+
         self.move_sp_to_shadow_sp();
         Ok(())
     }
@@ -121,12 +128,24 @@ impl Masm for MacroAssembler {
     fn frame_restore(&mut self) -> Result<()> {
         debug_assert_eq!(self.sp_offset, 0);
 
-        let lr = regs::lr();
-        let fp = regs::fp();
-
         // Sync the real stack pointer with the value of the shadow stack
         // pointer.
         self.move_shadow_sp_to_sp();
+
+        // Pop the shadow stack pointer. It's assumed that at this point
+        // `sp_offset` is 0 and therfore the real stack pointer should be
+        // 16-byte aligned.
+        let addr = Address::post_indexed_from_sp(SHADOW_STACK_POINTER_SLOT_SIZE as i64);
+        self.asm.uload(
+            addr,
+            writable!(regs::shadow_sp()),
+            OperandSize::S64,
+            TRUSTED_FLAGS,
+        );
+
+        // Restore the link register and frame pointer.
+        let lr = regs::lr();
+        let fp = regs::fp();
         let addr = Address::post_indexed_from_sp(16);
 
         self.asm.ldp(fp, lr, addr);
@@ -161,6 +180,17 @@ impl Masm for MacroAssembler {
         let ssp = regs::shadow_sp();
         self.asm
             .add_ir(bytes as u64, ssp, writable!(ssp), OperandSize::S64);
+
+        // We must ensure that the real stack pointer reflects the the offset
+        // tracked by `self.sp_offset`, we use such value to calculate
+        // alignment, which is crucial for calls.
+        //
+        // As an optimization: this synchronization doesn't need to happen all
+        // the time, in theory we could ensure to sync the shadow stack pointer
+        // with the stack pointer when alignment is required, like at callsites.
+        // This is the simplest approach at the time of writing, which
+        // integrates well with the rest of the aarch64 infrastructure.
+        self.move_shadow_sp_to_sp();
 
         self.decrement_sp(bytes);
         Ok(())
@@ -226,14 +256,14 @@ impl Masm for MacroAssembler {
             RegImm::Reg(reg) => reg,
         };
 
-        self.asm.str(src, dst, size);
+        self.asm.str(src, dst, size, TRUSTED_FLAGS);
         Ok(())
     }
 
     fn wasm_store(&mut self, src: Reg, dst: Self::Address, op_kind: StoreKind) -> Result<()> {
         self.with_aligned_sp(|masm| match op_kind {
             StoreKind::Operand(size) => {
-                masm.asm.str(src, dst, size);
+                masm.asm.str(src, dst, size, UNTRUSTED_FLAGS);
                 Ok(())
             }
             StoreKind::Atomic(_size) => {
@@ -251,7 +281,7 @@ impl Masm for MacroAssembler {
         mut load_callee: impl FnMut(&mut Self) -> Result<(CalleeKind, CallingConvention)>,
     ) -> Result<u32> {
         let alignment: u32 = <Self::ABI as abi::ABI>::call_stack_align().into();
-        let addend: u32 = <Self::ABI as abi::ABI>::arg_base_offset().into();
+        let addend: u32 = <Self::ABI as abi::ABI>::initial_frame_size().into();
         let delta = calculate_frame_adjustment(self.sp_offset()?.as_u32(), addend, alignment);
         let aligned_args_size = align_to(stack_args_size, alignment);
         let total_stack = delta + aligned_args_size;
@@ -297,11 +327,21 @@ impl Masm for MacroAssembler {
                 bail!(CodeGenError::unimplemented_masm_instruction())
             }
             LoadKind::Atomic(_, _) => bail!(CodeGenError::unimplemented_masm_instruction()),
+            LoadKind::VectorZero(_size) => {
+                bail!(CodeGenError::UnimplementedWasmLoadKind)
+            }
         })
     }
 
-    fn load_addr(&mut self, src: Self::Address, dst: WritableReg, size: OperandSize) -> Result<()> {
-        self.asm.uload(src, dst, size, TRUSTED_FLAGS);
+    fn compute_addr(
+        &mut self,
+        src: Self::Address,
+        dst: WritableReg,
+        size: OperandSize,
+    ) -> Result<()> {
+        let (base, offset) = src.unwrap_offset();
+        self.asm
+            .add_ir(u64::try_from(offset).unwrap(), base, dst, size);
         Ok(())
     }
 
@@ -386,9 +426,14 @@ impl Masm for MacroAssembler {
         size: OperandSize,
         trap: TrapCode,
     ) -> Result<()> {
-        self.add(dst, lhs, rhs, size)?;
-        self.asm.trapif(Cond::Hs, trap);
-        Ok(())
+        // Similar to all the other potentially-trapping operations, we need to
+        // ensure that the real SP is 16-byte aligned in case control flow is
+        // transferred to a signal handler.
+        self.with_aligned_sp(|masm| {
+            masm.add(dst, lhs, rhs, size)?;
+            masm.asm.trapif(Cond::Hs, trap);
+            Ok(())
+        })
     }
 
     fn sub(&mut self, dst: WritableReg, lhs: Reg, rhs: RegImm, size: OperandSize) -> Result<()> {
@@ -744,7 +789,7 @@ impl Masm for MacroAssembler {
     fn push(&mut self, reg: Reg, size: OperandSize) -> Result<StackSlot> {
         self.reserve_stack(size.bytes())?;
         let address = self.address_from_sp(SPOffset::from_u32(self.sp_offset))?;
-        self.asm.str(reg, address, size);
+        self.asm.str(reg, address, size, TRUSTED_FLAGS);
 
         Ok(StackSlot {
             offset: SPOffset::from_u32(self.sp_offset),
@@ -1134,8 +1179,7 @@ impl Masm for MacroAssembler {
         _lhs: Reg,
         _rhs: Reg,
         _dst: WritableReg,
-        _size: OperandSize,
-        _handle_overflow: HandleOverflowKind,
+        _kind: V128AddKind,
     ) -> Result<()> {
         Err(anyhow!(CodeGenError::unimplemented_masm_instruction()))
     }
@@ -1145,8 +1189,7 @@ impl Masm for MacroAssembler {
         _lhs: Reg,
         _rhs: Reg,
         _dst: WritableReg,
-        _size: OperandSize,
-        _handle_overflow: HandleOverflowKind,
+        _kind: V128SubKind,
     ) -> Result<()> {
         Err(anyhow!(CodeGenError::unimplemented_masm_instruction()))
     }
@@ -1154,7 +1197,7 @@ impl Masm for MacroAssembler {
     fn v128_mul(
         &mut self,
         _context: &mut CodeGenContext<Emission>,
-        _lane_width: OperandSize,
+        _kind: V128MulKind,
     ) -> Result<()> {
         Err(anyhow!(CodeGenError::unimplemented_masm_instruction()))
     }
@@ -1163,7 +1206,7 @@ impl Masm for MacroAssembler {
         bail!(CodeGenError::unimplemented_masm_instruction())
     }
 
-    fn v128_neg(&mut self, _op: WritableReg, _size: OperandSize) -> Result<()> {
+    fn v128_neg(&mut self, _op: WritableReg, _kind: V128NegKind) -> Result<()> {
         Err(anyhow!(CodeGenError::unimplemented_masm_instruction()))
     }
 
@@ -1174,6 +1217,133 @@ impl Masm for MacroAssembler {
         _shift_kind: ShiftKind,
     ) -> Result<()> {
         Err(anyhow!(CodeGenError::unimplemented_masm_instruction()))
+    }
+
+    fn v128_q15mulr_sat_s(
+        &mut self,
+        _lhs: Reg,
+        _rhs: Reg,
+        _dst: WritableReg,
+        _size: OperandSize,
+    ) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_all_true(&mut self, _src: Reg, _dst: WritableReg, _size: OperandSize) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_bitmask(&mut self, _src: Reg, _dst: WritableReg, _size: OperandSize) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_trunc(
+        &mut self,
+        _context: &mut CodeGenContext<Emission>,
+        _kind: V128TruncKind,
+    ) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_min(
+        &mut self,
+        _src1: Reg,
+        _src2: Reg,
+        _dst: WritableReg,
+        _kind: V128MinKind,
+    ) -> Result<()> {
+        Err(anyhow!(CodeGenError::unimplemented_masm_instruction()))
+    }
+
+    fn v128_max(
+        &mut self,
+        _src1: Reg,
+        _src2: Reg,
+        _dst: WritableReg,
+        _kind: V128MaxKind,
+    ) -> Result<()> {
+        Err(anyhow!(CodeGenError::unimplemented_masm_instruction()))
+    }
+
+    fn v128_extmul(
+        &mut self,
+        _context: &mut CodeGenContext<Emission>,
+        _kind: V128ExtMulKind,
+    ) -> Result<()> {
+        Err(anyhow!(CodeGenError::unimplemented_masm_instruction()))
+    }
+
+    fn v128_extadd_pairwise(
+        &mut self,
+        _src: Reg,
+        _dst: WritableReg,
+        _kind: V128ExtAddKind,
+    ) -> Result<()> {
+        Err(anyhow!(CodeGenError::unimplemented_masm_instruction()))
+    }
+
+    fn v128_dot(&mut self, _lhs: Reg, _rhs: Reg, _dst: WritableReg) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_popcnt(&mut self, _context: &mut CodeGenContext<Emission>) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_avgr(
+        &mut self,
+        _lhs: Reg,
+        _rhs: Reg,
+        _dst: WritableReg,
+        _size: OperandSize,
+    ) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_div(
+        &mut self,
+        _lhs: Reg,
+        _rhs: Reg,
+        _dst: WritableReg,
+        _size: OperandSize,
+    ) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_sqrt(&mut self, _src: Reg, _dst: WritableReg, _size: OperandSize) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_ceil(&mut self, _src: Reg, _dst: WritableReg, _size: OperandSize) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_floor(&mut self, _src: Reg, _dst: WritableReg, _size: OperandSize) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_nearest(&mut self, _src: Reg, _dst: WritableReg, _size: OperandSize) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_pmin(
+        &mut self,
+        _lhs: Reg,
+        _rhs: Reg,
+        _dst: WritableReg,
+        _size: OperandSize,
+    ) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
+    }
+
+    fn v128_pmax(
+        &mut self,
+        _lhs: Reg,
+        _rhs: Reg,
+        _dst: WritableReg,
+        _size: OperandSize,
+    ) -> Result<()> {
+        bail!(CodeGenError::unimplemented_masm_instruction())
     }
 }
 

@@ -13,6 +13,8 @@
 //! impl Registers for Regs {
 //!     type ReadGpr = u8;
 //!     type ReadWriteGpr = u8;
+//!     type ReadXmm = u8;
+//!     type ReadWriteXmm = u8;
 //! }
 //!
 //! // Then, build one of the `AND` instructions; this one operates on an
@@ -36,8 +38,10 @@
 //! With an [`Inst`], we can encode the instruction into a code buffer; see the
 //! [example](Inst).
 
-// All of the generated struct names use snake case.
-#![allow(non_camel_case_types)]
+#![allow(
+    non_camel_case_types,
+    reason = "all of the generated struct names use snake case"
+)]
 
 mod api;
 mod imm;
@@ -46,6 +50,7 @@ pub mod isle;
 mod mem;
 mod reg;
 mod rex;
+mod xmm;
 
 #[cfg(any(test, feature = "fuzz"))]
 pub mod fuzz;
@@ -72,15 +77,15 @@ pub use api::{
     AsReg, CodeSink, Constant, KnownOffset, KnownOffsetTable, Label, RegisterVisitor, Registers,
     TrapCode,
 };
-pub use imm::{Extension, Imm16, Imm32, Imm8, Simm32, Simm32PlusKnownOffset};
-pub use mem::{Amode, DeferredTarget, GprMem, Scale};
+pub use imm::{Extension, Imm16, Imm32, Imm8, Simm16, Simm32, Simm8};
+pub use mem::{
+    Amode, AmodeOffset, AmodeOffsetPlusKnownOffset, DeferredTarget, GprMem, Scale, XmmMem,
+};
 pub use reg::{Gpr, NonRspGpr, Size};
 pub use rex::RexFlags;
+pub use xmm::Xmm;
 
 /// List the files generated to create this assembler.
 pub fn generated_files() -> Vec<std::path::PathBuf> {
-    env!("ASSEMBLER_BUILT_FILES")
-        .split(':')
-        .map(std::path::PathBuf::from)
-        .collect()
+    include!(concat!(env!("OUT_DIR"), "/generated-files.rs"))
 }

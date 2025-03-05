@@ -2,10 +2,9 @@
 
 use super::{
     regs, Amode, Gpr, Inst, LabelUse, MachBuffer, MachLabel, OperandVisitor, OperandVisitorImpl,
-    SyntheticAmode, VCodeConstant, WritableGpr,
+    SyntheticAmode, VCodeConstant, WritableGpr, WritableXmm, Xmm,
 };
 use crate::ir::TrapCode;
-use arbitrary::Arbitrary;
 use cranelift_assembler_x64 as asm;
 
 /// Define the types of registers Cranelift will use.
@@ -14,6 +13,8 @@ pub struct CraneliftRegisters;
 impl asm::Registers for CraneliftRegisters {
     type ReadGpr = Gpr;
     type ReadWriteGpr = PairedGpr;
+    type ReadXmm = Xmm;
+    type ReadWriteXmm = PairedXmm;
 }
 
 /// A pair of registers, one for reading and one for writing.
@@ -31,8 +32,8 @@ pub struct PairedGpr {
 impl asm::AsReg for PairedGpr {
     fn enc(&self) -> u8 {
         let PairedGpr { read, write } = self;
-        let read = enc(read);
-        let write = enc(&write.to_reg());
+        let read = enc_gpr(read);
+        let write = enc_gpr(&write.to_reg());
         assert_eq!(read, write);
         write
     }
@@ -42,16 +43,20 @@ impl asm::AsReg for PairedGpr {
     }
 }
 
-impl<'a> Arbitrary<'a> for PairedGpr {
-    fn arbitrary(_: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        unimplemented!("assembler fuzzing is not implemented at this level")
-    }
+/// A pair of XMM registers, one for reading and one for writing.
+#[derive(Clone, Copy, Debug)]
+pub struct PairedXmm {
+    pub(crate) read: Xmm,
+    pub(crate) write: WritableXmm,
 }
 
-/// This bridges the gap between codegen and assembler register types.
-impl asm::AsReg for Gpr {
+impl asm::AsReg for PairedXmm {
     fn enc(&self) -> u8 {
-        enc(self)
+        let PairedXmm { read, write } = self;
+        let read = enc_xmm(read);
+        let write = enc_xmm(&write.to_reg());
+        assert_eq!(read, write);
+        write
     }
 
     fn new(_: u8) -> Self {
@@ -59,16 +64,42 @@ impl asm::AsReg for Gpr {
     }
 }
 
-impl<'a> Arbitrary<'a> for Gpr {
-    fn arbitrary(_: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        unimplemented!("assembler fuzzing is not implemented at this level")
+/// This bridges the gap between codegen and assembler for general purpose register types.
+impl asm::AsReg for Gpr {
+    fn enc(&self) -> u8 {
+        enc_gpr(self)
+    }
+
+    fn new(_: u8) -> Self {
+        panic!("disallow creation of new assembler registers")
     }
 }
 
-/// A helper method for extracting the hardware encoding of a register.
+/// This bridges the gap between codegen and assembler for xmm register types.
+impl asm::AsReg for Xmm {
+    fn enc(&self) -> u8 {
+        enc_xmm(self)
+    }
+
+    fn new(_: u8) -> Self {
+        panic!("disallow creation of new assembler registers")
+    }
+}
+
+/// A helper method for extracting the hardware encoding of a general purpose register.
 #[inline]
-fn enc(gpr: &Gpr) -> u8 {
+fn enc_gpr(gpr: &Gpr) -> u8 {
     if let Some(real) = gpr.to_reg().to_real_reg() {
+        real.hw_enc()
+    } else {
+        unreachable!()
+    }
+}
+
+/// A helper method for extracting the hardware encoding of an xmm register.
+#[inline]
+fn enc_xmm(xmm: &Xmm) -> u8 {
+    if let Some(real) = xmm.to_reg().to_real_reg() {
         real.hw_enc()
     } else {
         unreachable!()
@@ -103,6 +134,24 @@ impl<'a, T: OperandVisitor> asm::RegisterVisitor<CraneliftRegisters> for Regallo
     fn fixed_read_write(&mut self, _reg: &PairedGpr) {
         todo!()
     }
+
+    fn read_xmm(&mut self, reg: &mut Xmm) {
+        self.collector.reg_use(reg);
+    }
+
+    fn read_write_xmm(&mut self, reg: &mut PairedXmm) {
+        let PairedXmm { read, write } = reg;
+        self.collector.reg_use(read);
+        self.collector.reg_reuse_def(write, 0);
+    }
+
+    fn fixed_read_xmm(&mut self, _reg: &Xmm) {
+        todo!()
+    }
+
+    fn fixed_read_write_xmm(&mut self, _reg: &PairedXmm) {
+        todo!()
+    }
 }
 
 impl Into<asm::Amode<Gpr>> for SyntheticAmode {
@@ -114,7 +163,7 @@ impl Into<asm::Amode<Gpr>> for SyntheticAmode {
                     base,
                     flags,
                 } => asm::Amode::ImmReg {
-                    simm32: asm::Simm32PlusKnownOffset {
+                    simm32: asm::AmodeOffsetPlusKnownOffset {
                         simm32: simm32.into(),
                         offset: None,
                     },
@@ -140,7 +189,7 @@ impl Into<asm::Amode<Gpr>> for SyntheticAmode {
             },
             SyntheticAmode::IncomingArg { offset } => asm::Amode::ImmReg {
                 base: Gpr::unwrap_new(regs::rbp()),
-                simm32: asm::Simm32PlusKnownOffset {
+                simm32: asm::AmodeOffsetPlusKnownOffset {
                     simm32: (-i32::try_from(offset).unwrap()).into(),
                     offset: Some(offsets::KEY_INCOMING_ARG),
                 },
@@ -148,7 +197,7 @@ impl Into<asm::Amode<Gpr>> for SyntheticAmode {
             },
             SyntheticAmode::SlotOffset { simm32 } => asm::Amode::ImmReg {
                 base: Gpr::unwrap_new(regs::rbp()),
-                simm32: asm::Simm32PlusKnownOffset {
+                simm32: asm::AmodeOffsetPlusKnownOffset {
                     simm32: simm32.into(),
                     offset: Some(offsets::KEY_SLOT_OFFSET),
                 },

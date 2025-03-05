@@ -4,7 +4,7 @@
 //! throughout this crate to avoid depending on the `arbitrary` crate
 //! unconditionally (use the `fuzz` feature instead).
 
-use crate::{AsReg, Gpr, Inst, NonRspGpr, Registers, Simm32, Simm32PlusKnownOffset};
+use crate::{AmodeOffset, AmodeOffsetPlusKnownOffset, AsReg, Gpr, Inst, NonRspGpr, Registers, Xmm};
 use arbitrary::{Arbitrary, Result, Unstructured};
 use capstone::{arch::x86, arch::BuildsCapstone, arch::BuildsCapstoneSyntax, Capstone};
 
@@ -21,13 +21,16 @@ pub fn roundtrip(inst: &Inst<FuzzRegs>) {
     let assembled = assemble(inst);
     let expected = disassemble(&assembled);
 
-    // Check that our pretty-printed output matches the known-good output.
+    // Check that our pretty-printed output matches the known-good output. Trim
+    // off the instruction offset first.
     let expected = expected.split_once(' ').unwrap().1;
     let actual = inst.to_string();
-    if expected != actual {
+    if expected != actual && expected != replace_signed_immediates(&actual) {
         println!("> {inst}");
         println!("  debug: {inst:x?}");
         println!("  assembled: {}", pretty_print_hexadecimal(&assembled));
+        println!("  expected (capstone): {expected}");
+        println!("  actual (to_string):  {actual}");
         assert_eq!(expected, &actual);
     }
 }
@@ -55,9 +58,17 @@ fn disassemble(assembled: &[u8]) -> String {
     let insns = cs
         .disasm_all(assembled, 0x0)
         .expect("failed to disassemble");
-    assert_eq!(insns.len(), 1, "not a single instruction: {assembled:x?}");
+    assert_eq!(insns.len(), 1, "not a single instruction: {assembled:02x?}");
     let insn = insns.first().expect("at least one instruction");
-    assert_eq!(assembled.len(), insn.len());
+    assert_eq!(
+        assembled.len(),
+        insn.len(),
+        "\ncranelift generated {} bytes: {assembled:02x?}\n\
+         capstone  generated {} bytes: {:02x?}",
+        assembled.len(),
+        insn.len(),
+        insn.bytes(),
+    );
     insn.to_string()
 }
 
@@ -70,6 +81,81 @@ fn pretty_print_hexadecimal(hex: &[u8]) -> String {
     s
 }
 
+/// See `replace_signed_immediates`.
+macro_rules! hex_print_signed_imm {
+    ($hex:expr, $from:ty => $to:ty) => {{
+        #[allow(clippy::cast_possible_wrap, reason = "bit conversion is intended here")]
+        let imm = <$from>::from_str_radix($hex, 16).unwrap() as $to;
+        let mut simm = String::new();
+        if imm < 0 {
+            simm.push_str("-");
+        }
+        let abs = match imm.checked_abs() {
+            Some(i) => i,
+            None => <$to>::MIN,
+        };
+        if imm > -10 && imm < 10 {
+            simm.push_str(&format!("{:x}", abs));
+        } else {
+            simm.push_str(&format!("0x{:x}", abs));
+        }
+        simm
+    }};
+}
+
+/// Replace signed immediates in the disassembly with their unsigned hexadecimal
+/// equivalent. This is only necessary to match `capstone`'s complex
+/// pretty-printing rules; e.g. `capstone` will:
+/// - omit the `0x` prefix when printing `0x0` as `0`.
+/// - omit the `0x` prefix when print small values (less than 10)
+/// - print negative values as `-0x...` (signed hex) instead of `0xff...`
+///   (normal hex)
+fn replace_signed_immediates(dis: &str) -> std::borrow::Cow<str> {
+    match dis.find('$') {
+        None => dis.into(),
+        Some(idx) => {
+            let (prefix, rest) = dis.split_at(idx + 1); // Skip the '$'.
+            let (_, rest) = chomp("-", rest); // Skip the '-' if it's there.
+            let (_, rest) = chomp("0x", rest); // Skip the '0x' if it's there.
+            let n = rest.chars().take_while(char::is_ascii_hexdigit).count();
+            let (hex, rest) = rest.split_at(n); // Split at next non-hex character.
+            let simm = match hex.len() {
+                1 | 2 => hex_print_signed_imm!(hex, u8 => i8),
+                4 => hex_print_signed_imm!(hex, u16 => i16),
+                8 => hex_print_signed_imm!(hex, u32 => i32),
+                16 => hex_print_signed_imm!(hex, u64 => i64),
+                _ => panic!("unexpected length for hex: {hex}"),
+            };
+            format!("{prefix}{simm}{rest}").into()
+        }
+    }
+}
+
+// See `replace_signed_immediates`.
+fn chomp<'a>(pat: &str, s: &'a str) -> (&'a str, &'a str) {
+    if s.starts_with(pat) {
+        s.split_at(pat.len())
+    } else {
+        ("", s)
+    }
+}
+
+#[test]
+fn replace() {
+    assert_eq!(
+        replace_signed_immediates("andl $0xffffff9a, %r11d"),
+        "andl $-0x66, %r11d"
+    );
+    assert_eq!(
+        replace_signed_immediates("xorq $0xffffffffffffffbc, 0x7f139ecc(%r9)"),
+        "xorq $-0x44, 0x7f139ecc(%r9)"
+    );
+    assert_eq!(
+        replace_signed_immediates("subl $0x3ca77a19, -0x1a030f40(%r14)"),
+        "subl $0x3ca77a19, -0x1a030f40(%r14)"
+    );
+}
+
 /// Fuzz-specific registers.
 ///
 /// For the fuzzer, we do not need any fancy register types; see [`FuzzReg`].
@@ -79,6 +165,8 @@ pub struct FuzzRegs;
 impl Registers for FuzzRegs {
     type ReadGpr = FuzzReg;
     type ReadWriteGpr = FuzzReg;
+    type ReadXmm = FuzzReg;
+    type ReadWriteXmm = FuzzReg;
 }
 
 /// A simple `u8` register type for fuzzing only.
@@ -100,11 +188,11 @@ impl AsReg for FuzzReg {
     }
 }
 
-impl Arbitrary<'_> for Simm32PlusKnownOffset {
+impl Arbitrary<'_> for AmodeOffsetPlusKnownOffset {
     fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
         // For now, we don't generate offsets (TODO).
         Ok(Self {
-            simm32: Simm32::arbitrary(u)?,
+            simm32: AmodeOffset::arbitrary(u)?,
             offset: None,
         })
     }
@@ -123,11 +211,21 @@ impl<'a, R: AsReg> Arbitrary<'a> for Gpr<R> {
         Ok(Self(R::new(u.int_in_range(0..=15)?)))
     }
 }
+impl<'a, R: AsReg> Arbitrary<'a> for Xmm<R> {
+    fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+        Ok(Self(R::new(u.int_in_range(0..=15)?)))
+    }
+}
 
 /// Helper trait that's used to be the same as `Registers` except with an extra
 /// `for<'a> Arbitrary<'a>` bound on all of the associated types.
 pub trait RegistersArbitrary:
-    Registers<ReadGpr: for<'a> Arbitrary<'a>, ReadWriteGpr: for<'a> Arbitrary<'a>>
+    Registers<
+    ReadGpr: for<'a> Arbitrary<'a>,
+    ReadWriteGpr: for<'a> Arbitrary<'a>,
+    ReadXmm: for<'a> Arbitrary<'a>,
+    ReadWriteXmm: for<'a> Arbitrary<'a>,
+>
 {
 }
 
@@ -136,6 +234,8 @@ where
     R: Registers,
     R::ReadGpr: for<'a> Arbitrary<'a>,
     R::ReadWriteGpr: for<'a> Arbitrary<'a>,
+    R::ReadXmm: for<'a> Arbitrary<'a>,
+    R::ReadWriteXmm: for<'a> Arbitrary<'a>,
 {
 }
 
