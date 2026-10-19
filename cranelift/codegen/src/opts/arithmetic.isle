@@ -138,20 +138,25 @@
       (if-let false (i64_is_any_sign_power_of_two (i32_into_i64 d)))
       (ireduce ty (apply_div_const_magic_s32 (Opcode.Sdiv) (sextend $I32 x) d)))
 
+;; Constant remainders are pure nodes in the egraph (see
+;; `inst_predicates::is_nontrapping_const_rem`), so their rewrites are ordinary
+;; `simplify` rules rather than `simplify_skeleton` ones, and the extraction
+;; cost model is what makes them win over a hardware division.
+
 ;; x % 1 == 0
-(rule (simplify_skeleton (urem x (iconst_u ty 1))) (all_zero ty))
-(rule (simplify_skeleton (srem x (iconst_u ty 1))) (all_zero ty))
-(rule (simplify_skeleton (srem x (iconst_s ty -1))) (all_zero ty))
+(rule (simplify (urem_value ty x (iconst_u ty 1))) (all_zero ty))
+(rule (simplify (srem_value ty x (iconst_u ty 1))) (all_zero ty))
+(rule (simplify (srem_value ty x (iconst_s ty -1))) (all_zero ty))
 
 ;; Unsigned `x % d == x & ((1 << ilog2(d)) - 1)` when `d` is a power of two
-(rule (simplify_skeleton (urem x (iconst_u ty (u64_extract_power_of_two d))))
+(rule (simplify (urem_value ty x (iconst_u ty (u64_extract_power_of_two d))))
       (if-let true (u64_gt d 1))
       (let ((mask Value (iconst_u ty (u64_sub (u64_shl 1 (u64_ilog2 d)) 1))))
         (band ty x mask)))
 
 ;; Signed `x % d` when `d` is a (possibly negative) power of two is a little
 ;; more complicated
-(rule (simplify_skeleton (srem x d_val @ (iconst_s ty d)))
+(rule (simplify (srem_value ty x (iconst_s ty d)))
       ;; Interestingly, this same sequence works for both positive and negative
       ;; powers of two
       (if-let true (i64_is_any_sign_power_of_two d))
@@ -165,21 +170,69 @@
             (t5 Value (isub ty x t4)))
         t5))
 
-;; General cases for `urem` with constant divisors
-(rule (simplify_skeleton (urem x (iconst_u $I32 (u64_extract_non_zero (u32_from_u64 d)))))
+;; General cases for `urem` with constant divisors.
+(rule (simplify (urem_value $I32 x (iconst_u $I32 (u64_extract_non_zero (u32_from_u64 d)))))
       (if-let false (u32_is_power_of_two d))
       (apply_div_const_magic_u32 (Opcode.Urem) x d))
-(rule (simplify_skeleton (urem x (iconst_u $I64 (u64_extract_non_zero d))))
+(rule (simplify (urem_value $I64 x (iconst_u $I64 (u64_extract_non_zero d))))
       (if-let false (u64_is_power_of_two d))
       (apply_div_const_magic_u64 (Opcode.Urem) x d))
 
 ;; General cases for `srem` with constant divisors
-(rule (simplify_skeleton (srem x (iconst_s $I32 (i64_extract_non_zero (i32_from_i64 d)))))
+(rule (simplify (srem_value $I32 x (iconst_s $I32 (i64_extract_non_zero (i32_from_i64 d)))))
       (if-let false (i64_is_any_sign_power_of_two d))
       (apply_div_const_magic_s32 (Opcode.Srem) x d))
-(rule (simplify_skeleton (srem x (iconst_s $I64 (i64_extract_non_zero d))))
+(rule (simplify (srem_value $I64 x (iconst_s $I64 (i64_extract_non_zero d))))
       (if-let false (i64_is_any_sign_power_of_two d))
       (apply_div_const_magic_s64 (Opcode.Srem) x d))
+
+;; When a remainder is only compared against zero then the remainder itself is
+;; never needed: "is a multiple of `d`" is a multiply by the modular inverse of
+;; `d` followed by one compare, which is much cheaper than building the whole
+;; quotient and multiplying back to recover the remainder.  Divisors that are
+;; powers of two are left alone, since their remainder is already a single
+;; `band`.  Only equality and inequality are tests for divisibility, so the
+;; predicate is matched explicitly; the `div_const_test` helpers have no
+;; definition for the ordering predicates.
+(rule (simplify (icmp _ (IntCC.Equal) (urem_value $I32 x (iconst_u $I32 (u64_extract_non_zero (u32_from_u64 d)))) (iconst_u $I32 0)))
+      (if-let false (u32_is_power_of_two d))
+      (apply_div_const_test_u $I32 (IntCC.Equal) x (div_const_test_u32 d)))
+(rule (simplify (icmp _ (IntCC.NotEqual) (urem_value $I32 x (iconst_u $I32 (u64_extract_non_zero (u32_from_u64 d)))) (iconst_u $I32 0)))
+      (if-let false (u32_is_power_of_two d))
+      (apply_div_const_test_u $I32 (IntCC.NotEqual) x (div_const_test_u32 d)))
+(rule (simplify (icmp _ (IntCC.Equal) (urem_value $I64 x (iconst_u $I64 (u64_extract_non_zero d))) (iconst_u $I64 0)))
+      (if-let false (u64_is_power_of_two d))
+      (apply_div_const_test_u $I64 (IntCC.Equal) x (div_const_test_u64 d)))
+(rule (simplify (icmp _ (IntCC.NotEqual) (urem_value $I64 x (iconst_u $I64 (u64_extract_non_zero d))) (iconst_u $I64 0)))
+      (if-let false (u64_is_power_of_two d))
+      (apply_div_const_test_u $I64 (IntCC.NotEqual) x (div_const_test_u64 d)))
+;; Narrow remainders are tested in 32 bits, like their `udiv` counterparts.
+(rule (simplify (icmp _ (IntCC.Equal) (urem_value (ty_int (fits_in_16 ty)) x (iconst_u (ty_int (fits_in_16 ty)) (u64_extract_non_zero (u32_from_u64 d)))) (iconst_u (ty_int (fits_in_16 ty)) 0)))
+      (if-let false (u32_is_power_of_two d))
+      (apply_div_const_test_u $I32 (IntCC.Equal) (uextend $I32 x) (div_const_test_u32 d)))
+(rule (simplify (icmp _ (IntCC.NotEqual) (urem_value (ty_int (fits_in_16 ty)) x (iconst_u (ty_int (fits_in_16 ty)) (u64_extract_non_zero (u32_from_u64 d)))) (iconst_u (ty_int (fits_in_16 ty)) 0)))
+      (if-let false (u32_is_power_of_two d))
+      (apply_div_const_test_u $I32 (IntCC.NotEqual) (uextend $I32 x) (div_const_test_u32 d)))
+
+(rule (simplify (icmp _ (IntCC.Equal) (srem_value $I32 x (iconst_s $I32 (i64_extract_non_zero (i32_from_i64 d)))) (iconst_u $I32 0)))
+      (if-let false (i64_is_any_sign_power_of_two d))
+      (apply_div_const_test_s $I32 (IntCC.Equal) x (div_const_test_s32 d)))
+(rule (simplify (icmp _ (IntCC.NotEqual) (srem_value $I32 x (iconst_s $I32 (i64_extract_non_zero (i32_from_i64 d)))) (iconst_u $I32 0)))
+      (if-let false (i64_is_any_sign_power_of_two d))
+      (apply_div_const_test_s $I32 (IntCC.NotEqual) x (div_const_test_s32 d)))
+(rule (simplify (icmp _ (IntCC.Equal) (srem_value $I64 x (iconst_s $I64 (i64_extract_non_zero d))) (iconst_u $I64 0)))
+      (if-let false (i64_is_any_sign_power_of_two d))
+      (apply_div_const_test_s $I64 (IntCC.Equal) x (div_const_test_s64 d)))
+(rule (simplify (icmp _ (IntCC.NotEqual) (srem_value $I64 x (iconst_s $I64 (i64_extract_non_zero d))) (iconst_u $I64 0)))
+      (if-let false (i64_is_any_sign_power_of_two d))
+      (apply_div_const_test_s $I64 (IntCC.NotEqual) x (div_const_test_s64 d)))
+;; Same for narrow signed remainders.
+(rule (simplify (icmp _ (IntCC.Equal) (srem_value (ty_int (fits_in_16 ty)) x (iconst_s (ty_int (fits_in_16 ty)) (i64_extract_non_zero (i32_from_i64 d)))) (iconst_u (ty_int (fits_in_16 ty)) 0)))
+      (if-let false (i64_is_any_sign_power_of_two (i32_into_i64 d)))
+      (apply_div_const_test_s $I32 (IntCC.Equal) (sextend $I32 x) (div_const_test_s32 d)))
+(rule (simplify (icmp _ (IntCC.NotEqual) (srem_value (ty_int (fits_in_16 ty)) x (iconst_s (ty_int (fits_in_16 ty)) (i64_extract_non_zero (i32_from_i64 d)))) (iconst_u (ty_int (fits_in_16 ty)) 0)))
+      (if-let false (i64_is_any_sign_power_of_two (i32_into_i64 d)))
+      (apply_div_const_test_s $I32 (IntCC.NotEqual) (sextend $I32 x) (div_const_test_s32 d)))
 
 ;; x*2 == x+x
 (rule (simplify (imul ty x (iconst_u _ 2)))

@@ -1014,11 +1014,11 @@ block0(v0: i8):
 
 ; function %srem_zero_i8_divisor8(i8) -> i8 fast {
 ; block0(v0: i8):
-;     v14 = iconst.i8 7
-;     v15 = band v0, v14  ; v14 = 7
+;     v15 = iconst.i8 7
+;     v16 = band v0, v15  ; v15 = 7
 ;     v3 = iconst.i8 0
-;     v16 = icmp eq v15, v3  ; v3 = 0
-;     return v16
+;     v17 = icmp eq v16, v3  ; v3 = 0
+;     return v17
 ; }
 
 function %srem_zero_i16_divisor8(i16) -> i8 {
@@ -1032,11 +1032,11 @@ block0(v0: i16):
 
 ; function %srem_zero_i16_divisor8(i16) -> i8 fast {
 ; block0(v0: i16):
-;     v14 = iconst.i16 7
-;     v15 = band v0, v14  ; v14 = 7
+;     v15 = iconst.i16 7
+;     v16 = band v0, v15  ; v15 = 7
 ;     v3 = iconst.i16 0
-;     v16 = icmp eq v15, v3  ; v3 = 0
-;     return v16
+;     v17 = icmp eq v16, v3  ; v3 = 0
+;     return v17
 ; }
 
 function %srem_zero_i32_divisor2(i32) -> i8 {
@@ -1050,11 +1050,11 @@ block0(v0: i32):
 
 ; function %srem_zero_i32_divisor2(i32) -> i8 fast {
 ; block0(v0: i32):
-;     v14 = iconst.i32 1
-;     v15 = band v0, v14  ; v14 = 1
+;     v15 = iconst.i32 1
+;     v16 = band v0, v15  ; v15 = 1
 ;     v5 = iconst.i32 0
-;     v16 = icmp eq v15, v5  ; v5 = 0
-;     return v16
+;     v17 = icmp eq v16, v5  ; v5 = 0
+;     return v17
 ; }
 
 function %srem_zero_i32_divisor8(i32) -> i8 {
@@ -1068,11 +1068,11 @@ block0(v0: i32):
 
 ; function %srem_zero_i32_divisor8(i32) -> i8 fast {
 ; block0(v0: i32):
-;     v14 = iconst.i32 7
-;     v15 = band v0, v14  ; v14 = 7
+;     v15 = iconst.i32 7
+;     v16 = band v0, v15  ; v15 = 7
 ;     v3 = iconst.i32 0
-;     v16 = icmp eq v15, v3  ; v3 = 0
-;     return v16
+;     v17 = icmp eq v16, v3  ; v3 = 0
+;     return v17
 ; }
 
 function %srem_zero_i64_divisor64(i64) -> i8 {
@@ -1086,11 +1086,11 @@ block0(v0: i64):
 
 ; function %srem_zero_i64_divisor64(i64) -> i8 fast {
 ; block0(v0: i64):
-;     v14 = iconst.i64 63
-;     v15 = band v0, v14  ; v14 = 63
+;     v15 = iconst.i64 63
+;     v16 = band v0, v15  ; v15 = 63
 ;     v3 = iconst.i64 0
-;     v16 = icmp eq v15, v3  ; v3 = 0
-;     return v16
+;     v17 = icmp eq v16, v3  ; v3 = 0
+;     return v17
 ; }
 
 function %srem_zero_i32_divisorneg8(i32) -> i8 {
@@ -1104,11 +1104,11 @@ block0(v0: i32):
 
 ; function %srem_zero_i32_divisorneg8(i32) -> i8 fast {
 ; block0(v0: i32):
-;     v13 = iconst.i32 7
-;     v14 = band v0, v13  ; v13 = 7
+;     v14 = iconst.i32 7
+;     v15 = band v0, v14  ; v14 = 7
 ;     v3 = iconst.i32 0
-;     v15 = icmp eq v14, v3  ; v3 = 0
-;     return v15
+;     v16 = icmp eq v15, v3  ; v3 = 0
+;     return v16
 ; }
 
 function %srem_zero_i32_divisor7(i32) -> i8 {
@@ -1122,18 +1122,13 @@ block0(v0: i32):
 
 ; function %srem_zero_i32_divisor7(i32) -> i8 fast {
 ; block0(v0: i32):
-;     v5 = iconst.i32 -1840700269
-;     v6 = smulhi v0, v5  ; v5 = -1840700269
-;     v7 = iadd v6, v0
-;     v8 = iconst.i32 2
-;     v9 = sshr v7, v8  ; v8 = 2
-;     v10 = iconst.i32 31
-;     v11 = ushr v9, v10  ; v10 = 31
-;     v12 = iadd v9, v11
-;     v1 = iconst.i32 7
-;     v13 = imul v12, v1  ; v1 = 7
-;     v15 = icmp eq v0, v13
-;     return v15
+;     v17 = iconst.i32 -1227133513
+;     v18 = imul v0, v17  ; v17 = -1227133513
+;     v19 = iconst.i32 0x1249_2492
+;     v20 = iadd v18, v19  ; v19 = 0x1249_2492
+;     v21 = iconst.i32 0x2492_4924
+;     v22 = icmp ule v20, v21  ; v21 = 0x2492_4924
+;     return v22
 ; }
 
 function %srem_zero_shared_remainder(i32) -> i32, i8 {
@@ -1155,12 +1150,11 @@ block0(v0: i32):
 ;     v10 = iconst.i32 -8
 ;     v11 = band v9, v10  ; v10 = -8
 ;     v12 = isub v0, v11
-;     v2 -> v12
-;     v14 = iconst.i32 7
-;     v15 = band v0, v14  ; v14 = 7
+;     v15 = iconst.i32 7
+;     v16 = band v0, v15  ; v15 = 7
 ;     v3 = iconst.i32 0
-;     v16 = icmp eq v15, v3  ; v3 = 0
-;     return v12, v16
+;     v17 = icmp eq v16, v3  ; v3 = 0
+;     return v12, v17
 ; }
 
 function %rounding_eq_add0_eq0_shift29_mask8(i32, i32) -> i8 {
