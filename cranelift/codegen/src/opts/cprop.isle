@@ -35,11 +35,9 @@
       (if-let d (imm64_sdiv ty k1 k2))
       (iconst ty d))
 
-(rule (simplify_skeleton
-       (srem (iconst ty k1)
-             (iconst ty k2)))
+(rule (simplify (srem_value ty (iconst ty k1) (iconst ty k2)))
       (if-let d (imm64_srem ty k1 k2))
-      (iconst ty d))
+      (subsume (iconst ty d)))
 
 (rule (simplify_skeleton
        (udiv (iconst ty k1)
@@ -47,11 +45,9 @@
       (if-let d (imm64_udiv ty k1 k2))
       (iconst ty d))
 
-(rule (simplify_skeleton
-       (urem (iconst ty k1)
-             (iconst ty k2)))
+(rule (simplify (urem_value ty (iconst ty k1) (iconst ty k2)))
       (if-let d (imm64_urem ty k1 k2))
-      (iconst ty d))
+      (subsume (iconst ty d)))
 
 (rule (simplify
        (bor (fits_in_64 ty)

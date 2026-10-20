@@ -13,7 +13,6 @@ block0(v0: i32):
 ; block0(v0: i32):
 ;     v3 = iconst.i32 7
 ;     v4 = band v0, v3  ; v3 = 7
-;     v2 -> v4
 ;     return v4
 ; }
 
@@ -37,7 +36,6 @@ block0(v0: i32):
 ;     v1 = iconst.i32 1337
 ;     v11 = imul v10, v1  ; v1 = 1337
 ;     v12 = isub v0, v11
-;     v2 -> v12
 ;     return v12
 ; }
 
@@ -52,7 +50,6 @@ block0(v0: i64):
 ; block0(v0: i64):
 ;     v3 = iconst.i64 15
 ;     v4 = band v0, v3  ; v3 = 15
-;     v2 -> v4
 ;     return v4
 ; }
 
@@ -72,7 +69,6 @@ block0(v0: i64):
 ;     v1 = iconst.i64 0x3039
 ;     v7 = imul v6, v1  ; v1 = 0x3039
 ;     v8 = isub v0, v7
-;     v2 -> v8
 ;     return v8
 ; }
 

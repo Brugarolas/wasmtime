@@ -90,6 +90,13 @@ impl Cost {
             // "Expensive" arithmetic.
             Opcode::Imul => Cost::new(10),
 
+            // Integer division and remainder are far more expensive than the
+            // multiply/shift sequences that replace constant divisors, so they
+            // must be priced well above those sequences (which cost a few dozen
+            // units in total) or the extraction would keep a hardware division
+            // instead.
+            Opcode::Udiv | Opcode::Urem | Opcode::Sdiv | Opcode::Srem => Cost::new(50),
+
             // Everything else.
             _ => {
                 // By default, be slightly more expensive than "simple"

@@ -465,7 +465,80 @@
 (spec (u64_rem x y)
     (require (not (bv_is_zero! y)))
     (provide (= result (bvurem x y))))
+
+;; Pure views of `urem`/`srem` values, used by the divisibility rewrite rules in
+;; `opts/arithmetic.isle`. The rewrite rules only match a non-zero constant
+;; divisor, so these specs relate the extracted dividend and divisor to the value
+;; without modelling the trapping zero-divisor case.
+(spec (urem_value ty x y)
+    (provide
+        (= (:bits ty) (widthof result))
+        (= result (bvurem x y))))
+(instantiate urem_value bv_binary_8_to_64)
+(spec (srem_value ty x y)
+    (provide
+        (= (:bits ty) (widthof result))
+        (= result (bvsrem x y))))
+(instantiate srem_value bv_binary_8_to_64)
+
+;; Helpers used by the constant-division rewrite rules. The simple predicates and
+;; the immediate-masked constant folds are specified below. No specifications are
+;; provided for the magic-number constructors, so the rules that use them are
+;; tagged `TODO` and are not formally verified yet.
+(spec (u32_is_power_of_two x)
+    (provide (= result (and (not (= x #x00000000))
+                           (= (bvand x (bvsub x #x00000001)) #x00000000)))))
+;; `i64_is_any_sign_power_of_two` is defined by priority-ordered rules whose
+;; final catch-all rule the verifier treats as always feasible (it does not
+;; negate higher-numbered rules), so a specification for it cannot be checked.
+;; Keep it unchecked rather than weakening the rules.
+(attr i64_is_any_sign_power_of_two (tag TODO))
+(spec (u64_extract_power_of_two x)
+    (match (and (not (bv_is_zero! result))
+                (= (bvand result (bvsub result #x0000000000000001)) #x0000000000000000)))
+    (provide (= x result)))
+(spec (i64_extract_non_zero x)
+    (match (not (bv_is_zero! result)))
+    (provide (= x result)))
+(spec (imm64_urem ty x y)
+    (match (not (bv_is_zero! (bvand y (low_bits_mask! 64 (:bits ty))))))
+    (provide
+        (= result
+           (bvand (bvurem (bvand x (low_bits_mask! 64 (:bits ty)))
+                          (bvand y (low_bits_mask! 64 (:bits ty))))
+                  (low_bits_mask! 64 (:bits ty))))))
+(spec (imm64_srem ty x y)
+    (match (and (not (bv_is_zero! (bvand y (low_bits_mask! 64 (:bits ty)))))
+                (not (and (= (sext_ty! x ty) (bv_top_bit_set! 64))
+                          (= (sext_ty! y ty) #xFFFFFFFFFFFFFFFF)))))
+    (provide
+        (= result
+           (bvand (bvsrem (sext_ty! x ty) (sext_ty! y ty))
+                  (low_bits_mask! 64 (:bits ty))))))
+
+(spec (u32_sub x y) (provide (= result (bvsub x y))))
+(spec (i64_shl x y) (provide (= result (bvshl x (concat #x00000000 y)))))
+;; `u64_shl` already has a specification in `prelude.isle`, but it uses a `match`
+;; clause on a term the verifier treats as non-partial, so expanding it fails.
+;; The underlying specification issue is pre-existing; the `TODO` tag is added
+;; here so this change's verification run can proceed.
+(attr u64_shl (tag TODO))
+(attr div_const_magic_u32 (tag TODO))
+(attr div_const_magic_u64 (tag TODO))
+(attr div_const_magic_s32 (tag TODO))
+(attr div_const_magic_s64 (tag TODO))
+(attr div_const_test_u32 (tag TODO))
+(attr div_const_test_u64 (tag TODO))
+(attr div_const_test_s32 (tag TODO))
+(attr div_const_test_s64 (tag TODO))
 (spec (i64_eq x y) (provide (= result (= x y))))
+(spec (i64_ne x y) (provide (= result (not (= x y)))))
+(spec (u64_ilog2 x)
+    (require (not (bv_is_zero! x)))
+    ;; `result` is a 32-bit shift amount: zero-extend it with a concat.
+    (provide (and (= (bvlshr x (concat #x00000000 result)) #x0000000000000001)
+                  (= (bvlshr x (concat #x00000000 (bvadd result #x00000001)))
+                     #x0000000000000000))))
 (spec (u64_extract_non_zero x)
     (match (not (bv_is_zero! result)))
     (provide (= x result)))

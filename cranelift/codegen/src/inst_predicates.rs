@@ -41,6 +41,40 @@ fn has_side_effect(func: &Function, inst: Inst) -> bool {
     trivially_has_side_effects(opcode) || is_load_with_defined_trapping(opcode, data, &func.dfg)
 }
 
+/// Is this a remainder by a constant divisor that can never trap?
+///
+/// `urem` and `srem` trap only when the divisor is zero; `srem` does not trap on
+/// `INT_MIN % -1` (its result is 0 there).  Every non-zero constant divisor
+/// therefore makes the remainder free of observable effects, which in turn lets
+/// the egraph reason about it like any other pure arithmetic operation.
+fn is_nontrapping_const_rem(func: &Function, inst: Inst) -> bool {
+    let op = func.dfg.insts[inst].opcode();
+    if !matches!(op, Opcode::Urem | Opcode::Srem) {
+        return false;
+    }
+    let [_, divisor] = func.dfg.inst_args(inst) else {
+        return false;
+    };
+    let width = func.dfg.value_type(*divisor).bits();
+    let mask = if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
+    let bits = match func.dfg.value_def(*divisor) {
+        ir::ValueDef::Result(inst, 0) => match func.dfg.insts[inst] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => (imm.bits() as u64) & mask,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    // A zero divisor traps; every other constant divisor is defined.
+    bits != 0
+}
+
 /// Does the given instruction behave as a "pure" node with respect to
 /// aegraph semantics?
 ///
@@ -71,7 +105,10 @@ pub fn is_pure_for_egraph(func: &Function, inst: Inst) -> bool {
 
     let op = func.dfg.insts[inst].opcode();
 
-    has_one_result && (is_pure_load || (!op.can_load() && !trivially_has_side_effects(op)))
+    has_one_result
+        && (is_pure_load
+            || (!op.can_load() && !trivially_has_side_effects(op))
+            || is_nontrapping_const_rem(func, inst))
 }
 
 /// Can the given instruction be merged into another copy of itself?
