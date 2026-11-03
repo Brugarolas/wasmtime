@@ -992,6 +992,80 @@ pub enum Prepared<'a, T: 'static> {
     },
 }
 
+/// A request authority is `uri-host [ ":" port ]`, without userinfo
+/// (RFC 3986 section 3.2, RFC 9110 section 7.2).
+fn validate_authority(authority: &http::uri::Authority) -> Result<()> {
+    if authority.as_str().contains('@') {
+        return Err(bad_request("HTTP request has an invalid authority"));
+    }
+    let host = authority.host();
+    if host.is_empty() {
+        return Err(bad_request("HTTP request has an invalid authority"));
+    }
+    // `Authority` stores the port as a string; a non-numeric or empty port
+    // parses as an authority with no port, so check the suffix directly.
+    let rest = &authority.as_str()[host.len()..];
+    if !rest.is_empty() && (!rest.starts_with(':') || rest[1..].parse::<u16>().is_err()) {
+        return Err(bad_request("HTTP request has an invalid authority"));
+    }
+    Ok(())
+}
+
+/// Determine the authority of the incoming request's target, validating `Host`
+/// (RFC 9112 section 3.2) and its relation to `:authority` (RFC 9113 section 8.3.1).
+fn get_request_target(request: &Request) -> Result<http::uri::Authority> {
+    use http::header::HOST;
+
+    let mut hosts = request.headers().get_all(HOST).iter();
+    let host = hosts.next();
+    if hosts.next().is_some() {
+        return Err(bad_request("HTTP request has multiple Host header fields"));
+    }
+    let host = match host {
+        Some(host) => {
+            let host = host
+                .to_str()
+                .map_err(|_| bad_request("HTTP request has a non-ASCII Host header value"))?;
+            let host = host
+                .parse::<http::uri::Authority>()
+                .map_err(|_| bad_request("HTTP request has an invalid Host header value"))?;
+            validate_authority(&host)?;
+            Some(host)
+        }
+        None => None,
+    };
+    let authority = request.uri().authority().cloned();
+    if let Some(authority) = &authority {
+        validate_authority(authority)?;
+    }
+    match (authority, host) {
+        (Some(authority), Some(host)) => {
+            // When both are present HTTP/2 requires them to agree; HTTP/1.1
+            // absolute-form instead ignores `Host` (RFC 9112 section 3.2.2).
+            if request.version() == http::Version::HTTP_2
+                && !authority.as_str().eq_ignore_ascii_case(host.as_str())
+            {
+                return Err(bad_request("HTTP request has an invalid Host header value"));
+            }
+            Ok(authority)
+        }
+        (Some(authority), None) => {
+            // HTTP/1.1 requires `Host` even for absolute-form; HTTP/2 does not.
+            if request.version() == http::Version::HTTP_2 {
+                Ok(authority)
+            } else {
+                Err(bad_request("HTTP request is missing a Host header field"))
+            }
+        }
+        (None, Some(host)) => Ok(host),
+        (None, None) => Err(bad_request("HTTP request is missing a Host header field")),
+    }
+}
+
+fn bad_request(message: &'static str) -> wasmtime::Error {
+    wasmtime::Error::msg(message).context(crate::ErrorResponse::new(http::StatusCode::BAD_REQUEST))
+}
+
 impl<'a, T: Send> Prepared<'a, T> {
     /// Creates a new prepared request.
     pub fn new(
@@ -1004,10 +1078,39 @@ impl<'a, T: Send> Prepared<'a, T> {
         match proxy {
             #[cfg(feature = "p3")]
             Proxy::P3(guest) => {
-                let (request, body) = request.into_parts();
-                let request = http::Request::from_parts(request, body);
+                let authority = match get_request_target(&request) {
+                    Ok(authority) => authority,
+                    Err(e) => {
+                        // The request never reached the guest, so report the
+                        // failure through `tx` like the p2 path does.
+                        _ = tx.send(Err(e));
+                        wasmtime::bail!(
+                            "request was rejected before it could be turned into a guest request"
+                        );
+                    }
+                };
+
+                let (parts, body) = request.into_parts();
+                let http::request::Parts {
+                    method,
+                    uri,
+                    headers: request_headers,
+                    ..
+                } = parts;
+                let http::uri::Parts { path_and_query, .. } = uri.into_parts();
                 let hooks = view(store.data_mut()).hooks;
-                let (request, request_io_result) = p3::Request::from_http(hooks, request);
+                let headers = crate::FieldMap::new_immutable(hooks, request_headers);
+                // `serve` speaks plaintext HTTP, so that is the scheme of every
+                // request, whatever scheme its request target names (as in p2).
+                let (request, request_io_result) = p3::Request::new(
+                    method,
+                    Some(http::uri::Scheme::HTTP),
+                    Some(authority),
+                    path_and_query,
+                    headers,
+                    None,
+                    body,
+                );
                 let request = view(store.data_mut()).table.push(request)?;
 
                 Ok(Prepared::P3 {
@@ -1023,6 +1126,15 @@ impl<'a, T: Send> Prepared<'a, T> {
             }
             #[cfg(feature = "p2")]
             Proxy::P2(guest) => {
+                // The p2 path builds its own copy of the request, so only the
+                // request-target checks of the helper are used here.
+                if let Err(e) = get_request_target(&request) {
+                    _ = tx.send(Err(e));
+                    wasmtime::bail!(
+                        "request was rejected before it could be turned into a guest request"
+                    );
+                }
+
                 // Here we wrap the sender in an `Arc<Mutex<Option<_>>>`, with one
                 // clone used in the `response-outparam` and the other used to send
                 // an error if the request expires or the handler returns without

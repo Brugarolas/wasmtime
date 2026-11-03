@@ -287,6 +287,24 @@ impl<T> Mmap<T> {
         self.sys.len()
     }
 
+    /// Panics if the range start or end aren't in bounds, in the proper order,
+    /// or page-aligned. Returns whether the range is non-zero size and thus
+    /// merits further action.
+    fn check_range(&self, range: &Range<usize>) -> bool {
+        assert!(range.start <= self.len());
+        assert!(range.end <= self.len());
+        assert!(range.start <= range.end);
+        assert!(
+            range.start % crate::runtime::vm::host_page_size() == 0,
+            "changing of protections isn't page-aligned",
+        );
+
+        // A zero-sized mprotect (or equivalent) is allowed on some
+        // platforms but not others (notably Windows). Treat it as a no-op
+        // everywhere.
+        range.start != range.end
+    }
+
     /// Makes the specified `range` within this `Mmap` to be read/execute.
     ///
     /// # Unsafety
@@ -304,74 +322,50 @@ impl<T> Mmap<T> {
         range: Range<usize>,
         enable_branch_protection: bool,
     ) -> Result<()> {
-        assert!(range.start <= self.len());
-        assert!(range.end <= self.len());
-        assert!(range.start <= range.end);
-        assert!(
-            range.start % crate::runtime::vm::host_page_size() == 0,
-            "changing of protections isn't page-aligned",
-        );
-
-        if range.start == range.end {
-            // A zero-sized mprotect (or equivalent) is allowed on some
-            // platforms but not others (notably Windows). Treat it as a no-op
-            // everywhere.
-            return Ok(());
+        if self.check_range(&range) {
+            return unsafe {
+                self.sys
+                    .make_executable(range, enable_branch_protection)
+                    .context("failed to make memory executable")
+            };
         }
-
-        unsafe {
-            self.sys
-                .make_executable(range, enable_branch_protection)
-                .context("failed to make memory executable")
-        }
+        Ok(())
     }
 
     /// Makes the specified `range` within this `Mmap` to be readonly.
     pub unsafe fn make_readonly(&self, range: Range<usize>) -> Result<()> {
-        assert!(range.start <= self.len());
-        assert!(range.end <= self.len());
-        assert!(range.start <= range.end);
-        assert!(
-            range.start % crate::runtime::vm::host_page_size() == 0,
-            "changing of protections isn't page-aligned",
-        );
-
-        if range.start == range.end {
-            // A zero-sized mprotect (or equivalent) is allowed on some
-            // platforms but not others (notably Windows). Treat it as a no-op
-            // everywhere.
-            return Ok(());
+        if self.check_range(&range) {
+            return unsafe {
+                self.sys
+                    .make_readonly(range)
+                    .context("failed to make memory readonly")
+            };
         }
-
-        unsafe {
-            self.sys
-                .make_readonly(range)
-                .context("failed to make memory readonly")
-        }
+        Ok(())
     }
 
     /// Makes the specified `range` within this `Mmap` to be read-write.
     pub unsafe fn make_readwrite(&self, range: Range<usize>) -> Result<()> {
-        assert!(range.start <= self.len());
-        assert!(range.end <= self.len());
-        assert!(range.start <= range.end);
-        assert!(
-            range.start % crate::runtime::vm::host_page_size() == 0,
-            "changing of protections isn't page-aligned",
-        );
-
-        if range.start == range.end {
-            // A zero-sized mprotect (or equivalent) is allowed on some
-            // platforms but not others (notably Windows). Treat it as a no-op
-            // everywhere.
-            return Ok(());
+        if self.check_range(&range) {
+            return unsafe {
+                self.sys
+                    .make_readwrite(range)
+                    .context("failed to make memory read-write")
+            };
         }
+        Ok(())
+    }
 
-        unsafe {
-            self.sys
-                .make_readwrite(range)
-                .context("failed to make memory read-write")
+    /// Makes the specified `range` within this `Mmap` inaccessible.
+    pub unsafe fn make_inaccessible(&self, range: Range<usize>) -> Result<()> {
+        if self.check_range(&range) {
+            return unsafe {
+                self.sys
+                    .make_inaccessible(range)
+                    .context("failed to make memory inaccessible")
+            };
         }
+        Ok(())
     }
 }
 
@@ -454,11 +448,21 @@ impl MmapOffset {
             .offset
             .checked_add(memory_offset)
             .expect("self.offset + memory_offset is in bounds");
-        unsafe {
-            self.mmap
-                .sys
-                .map_image_at(image_source, source_offset, total_offset, memory_len)
+        if !total_offset
+            .checked_add(memory_len)
+            .is_ok_and(|end| end <= self.mmap.len_aligned())
+        {
+            bail!("image mapping must be in bounds of the mmap")
         }
+        unsafe {
+            let base = self
+                .mmap
+                .as_non_null()
+                .byte_add(total_offset.byte_count())
+                .as_ptr();
+            image_source.map_at(base, source_offset, memory_len.byte_count())?;
+        }
+        Ok(())
     }
 }
 
@@ -489,5 +493,69 @@ mod tests {
             mem.make_readonly(pagex3.byte_count()..pagex3.byte_count())
                 .expect("make_readonly succeeded");
         };
+    }
+
+    /// Creates a two-page inaccessible mmap and a one-page image source whose
+    /// bytes are all `0x67`.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn mmap_and_image_source() -> (Arc<Mmap<AlignedLength>>, MemoryImageSource) {
+        let page_size = HostAlignedByteCount::host_page_size();
+        let pagex2 = page_size.checked_mul(2).unwrap();
+        let mmap = Mmap::accessible_reserved(HostAlignedByteCount::ZERO, pagex2)
+            .expect("allocated memory");
+        let data = vec![0x67; page_size.byte_count()];
+        let source = MemoryImageSource::from_data(&data)
+            .expect("created image source")
+            .expect("memfd is supported");
+        (Arc::new(mmap), source)
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn map_image_at_up_to_end_of_mmap() {
+        let page_size = HostAlignedByteCount::host_page_size();
+        let (mmap, source) = mmap_and_image_source();
+        let base = mmap.offset(page_size).unwrap();
+        // SAFETY: the mmap was just created and nothing references it.
+        unsafe {
+            base.map_image_at(&source, 0, HostAlignedByteCount::ZERO, page_size)
+                .expect("mapped image");
+            let mapped = core::slice::from_raw_parts(base.as_mut_ptr(), page_size.byte_count());
+            assert!(mapped.iter().all(|b| *b == 0x67));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn map_image_at_past_end_of_mmap() {
+        let page_size = HostAlignedByteCount::host_page_size();
+        let (mmap, source) = mmap_and_image_source();
+        let base = mmap.offset(page_size).unwrap();
+        // End the mapping at the highest page-aligned address: `offset + len`
+        // doesn't overflow, but `len` exceeds any address space, so should the
+        // assertion ever regress the kernel rejects the `mmap` instead of
+        // mapping over memory that this test doesn't own.
+        let max_aligned = usize::MAX - usize::MAX % page_size.byte_count();
+        let max = HostAlignedByteCount::new(max_aligned).unwrap();
+        let huge = max.checked_sub(page_size).unwrap();
+        // SAFETY: the mmap was just created and nothing references it. The
+        // call is expected to return Err before mapping anything.
+        let result = unsafe { base.map_image_at(&source, 0, HostAlignedByteCount::ZERO, huge) };
+        assert!(result.is_err());
+    }
+
+    /// An offset and length whose sum overflows must be rejected as well.
+    #[test]
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn map_image_at_overflowing_length() {
+        let page_size = HostAlignedByteCount::host_page_size();
+        let (mmap, source) = mmap_and_image_source();
+        let base = mmap.offset(page_size).unwrap();
+        let max_aligned = usize::MAX - usize::MAX % page_size.byte_count();
+        let max = HostAlignedByteCount::new(max_aligned).unwrap();
+        // SAFETY: the mmap was just created and nothing references it. The
+        // call is expected to panic before mapping anything.
+        let result = unsafe { base.map_image_at(&source, 0, HostAlignedByteCount::ZERO, max) };
+        assert!(result.is_err());
     }
 }

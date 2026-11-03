@@ -1,19 +1,17 @@
 use crate::MemoryType;
-use crate::memory::{LinearMemory, MemoryCreator};
 use crate::prelude::*;
 use crate::runtime::vm::mpk::ProtectionKey;
 use crate::runtime::vm::{
     CompiledModuleId, InstanceAllocationRequest, InstanceAllocator, Memory, MemoryAllocationIndex,
-    MemoryBase, ModuleRuntimeInfo, OnDemandInstanceAllocator, RuntimeLinearMemory,
-    RuntimeMemoryCreator, SharedMemory, Table, TableAllocationIndex,
+    ModuleRuntimeInfo, OnDemandInstanceAllocator, SharedMemory, Table, TableAllocationIndex,
 };
 use crate::store::{AllocateInstanceKind, InstanceId, StoreOpaque, StoreResourceLimiter};
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
 use wasmtime_environ::{
-    DefinedMemoryIndex, DefinedTableIndex, EntityIndex, HostPtr, MemoryKind, MemoryTunables,
-    Module, StaticModuleIndex, VMOffsets,
+    DefinedMemoryIndex, DefinedTableIndex, EntityIndex, HostPtr, MemoryKind, Module,
+    StaticModuleIndex, VMOffsets,
 };
 
 #[cfg(feature = "component-model")]
@@ -49,10 +47,16 @@ pub async fn create_memory(
     // We create an instance in the on-demand allocator when creating handles
     // associated with external objects. The configured instance allocator
     // should only be used when creating module instances as we don't want host
-    // objects to count towards instance limits.
+    // objects to count towards instance limits. Host-created memories must
+    // still use the configured memory creator, though, see
+    // `Config::with_host_memory`.
     let allocator = SingleMemoryInstance {
         preallocation,
-        ondemand: OnDemandInstanceAllocator::default(),
+        ondemand: OnDemandInstanceAllocator::new(
+            store.engine().config().mem_creator.clone(),
+            0,
+            false,
+        ),
     };
     unsafe {
         store
@@ -65,61 +69,6 @@ pub async fn create_memory(
                 Default::default(),
             )
             .await
-    }
-}
-
-struct LinearMemoryProxy {
-    mem: Box<dyn LinearMemory>,
-}
-
-impl RuntimeLinearMemory for LinearMemoryProxy {
-    fn byte_size(&self) -> usize {
-        self.mem.byte_size()
-    }
-
-    fn byte_capacity(&self) -> usize {
-        self.mem.byte_capacity()
-    }
-
-    fn grow_to(&mut self, new_size: usize) -> Result<()> {
-        self.mem.grow_to(new_size)
-    }
-
-    fn base(&self) -> MemoryBase {
-        MemoryBase::new_raw(self.mem.as_ptr())
-    }
-
-    fn vmmemory(&self) -> crate::vm::VMMemoryDefinition {
-        let base = core::ptr::NonNull::new(self.mem.as_ptr()).unwrap();
-        crate::vm::VMMemoryDefinition {
-            base: base.into(),
-            current_length: self.mem.byte_size().into(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct MemoryCreatorProxy(pub Arc<dyn MemoryCreator>);
-
-impl RuntimeMemoryCreator for MemoryCreatorProxy {
-    fn new_memory(
-        &self,
-        ty: &wasmtime_environ::Memory,
-        memory_tunables: &MemoryTunables<'_>,
-        minimum: usize,
-        maximum: Option<usize>,
-    ) -> Result<Box<dyn RuntimeLinearMemory>> {
-        let reserved_size_in_bytes = Some(memory_tunables.reservation().try_into().unwrap());
-        self.0
-            .new_memory(
-                MemoryType::from_wasmtime_memory(ty),
-                minimum,
-                maximum,
-                reserved_size_in_bytes,
-                usize::try_from(memory_tunables.guard_size()).unwrap(),
-            )
-            .map(|mem| Box::new(LinearMemoryProxy { mem }) as Box<dyn RuntimeLinearMemory>)
-            .map_err(|e| format_err!(e))
     }
 }
 

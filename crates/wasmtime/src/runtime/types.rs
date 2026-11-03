@@ -1938,7 +1938,8 @@ impl StructType {
     ///
     /// # Panics
     ///
-    /// Panics if any given field type is not associated with the given engine.
+    /// Panics if any given field type, or the supertype, is not associated
+    /// with the given engine.
     pub fn with_finality_and_supertype(
         engine: &Engine,
         finality: Finality,
@@ -1978,6 +1979,7 @@ impl StructType {
             .try_collect()?;
 
         if let Some(supertype) = supertype {
+            assert!(supertype.comes_from_same_engine(engine));
             ensure!(
                 supertype.finality().is_non_final(),
                 "cannot create a subtype of a final supertype"
@@ -2215,7 +2217,8 @@ impl ArrayType {
     ///
     /// # Panics
     ///
-    /// Panics if the given field type is not associated with the given engine.
+    /// Panics if the given field type, or the supertype, is not associated
+    /// with the given engine.
     pub fn with_finality_and_supertype(
         engine: &Engine,
         finality: Finality,
@@ -2494,8 +2497,8 @@ impl FuncType {
     ///
     /// # Panics
     ///
-    /// Panics if any parameter or value type is not associated with the given
-    /// engine.
+    /// Panics if any parameter or value type, or the supertype, is not
+    /// associated with the given engine.
     pub fn with_finality_and_supertype(
         engine: &Engine,
         finality: Finality,
@@ -2676,18 +2679,9 @@ impl FuncType {
     pub fn matches(&self, other: &FuncType) -> bool {
         assert!(self.comes_from_same_engine(other.engine()));
 
-        // Avoid matching on structure for subtyping checks when we have
-        // precisely the same type.
-        if self.type_index() == other.type_index() {
-            return true;
-        }
-
-        Self::matches_impl(
-            self.params(),
-            other.params(),
-            self.results(),
-            other.results(),
-        )
+        self.engine()
+            .signatures()
+            .is_subtype(self.type_index(), other.type_index())
     }
 
     fn matches_impl(

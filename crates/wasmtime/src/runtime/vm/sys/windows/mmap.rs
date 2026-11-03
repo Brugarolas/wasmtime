@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use crate::runtime::vm::sys::vm::MemoryImageSource;
 use crate::runtime::vm::{HostAlignedByteCount, SendSyncPtr};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -236,38 +235,32 @@ impl Mmap {
         Ok(())
     }
 
-    pub unsafe fn make_readonly(&self, range: Range<usize>) -> Result<()> {
+    unsafe fn change_protections(
+        &self,
+        range: Range<usize>,
+        permissions: PAGE_PROTECTION_FLAGS,
+    ) -> Result<()> {
         let mut old = 0;
         unsafe {
             let base = self.as_send_sync_ptr().as_ptr().add(range.start).cast();
-            let result = VirtualProtect(base, range.end - range.start, PAGE_READONLY, &mut old);
+            let result = VirtualProtect(base, range.end - range.start, permissions, &mut old);
             if result == 0 {
                 bail!(io::Error::last_os_error());
             }
         }
         Ok(())
+    }
+
+    pub unsafe fn make_readonly(&self, range: Range<usize>) -> Result<()> {
+        unsafe { self.change_protections(range, PAGE_READONLY) }
     }
 
     pub unsafe fn make_readwrite(&self, range: Range<usize>) -> Result<()> {
-        let mut old = 0;
-        unsafe {
-            let base = self.as_send_sync_ptr().as_ptr().add(range.start).cast();
-            let result = VirtualProtect(base, range.end - range.start, PAGE_READWRITE, &mut old);
-            if result == 0 {
-                bail!(io::Error::last_os_error());
-            }
-        }
-        Ok(())
+        unsafe { self.change_protections(range, PAGE_READWRITE) }
     }
 
-    pub unsafe fn map_image_at(
-        &self,
-        image_source: &MemoryImageSource,
-        _source_offset: u64,
-        _memory_offset: HostAlignedByteCount,
-        _memory_len: HostAlignedByteCount,
-    ) -> Result<()> {
-        match *image_source {}
+    pub unsafe fn make_inaccessible(&self, range: Range<usize>) -> Result<()> {
+        unsafe { self.change_protections(range, PAGE_NOACCESS) }
     }
 }
 

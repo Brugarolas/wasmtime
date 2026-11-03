@@ -7,35 +7,6 @@ use wasmtime_test_macros::wasmtime_test;
 
 #[wasmtime_test]
 #[cfg_attr(miri, ignore)]
-fn call_wasm_to_wasm(config: &mut Config) -> Result<()> {
-    let wasm = wat::parse_str(
-        r#"
-          (module
-            (func (result i32 i32 i32)
-              i32.const 1
-              i32.const 2
-              i32.const 3
-            )
-            (func (export "run") (result i32 i32 i32)
-                call 0
-            )
-          )
-        "#,
-    )?;
-    let engine = Engine::new(&config)?;
-    let mut store = Store::<()>::new(&engine, ());
-    let module = Module::new(store.engine(), &wasm)?;
-    let instance = Instance::new(&mut store, &module, &[])?;
-    let func = instance
-        .get_typed_func::<(), (i32, i32, i32)>(&mut store, "run")
-        .unwrap();
-    let results = func.call(&mut store, ())?;
-    assert_eq!(results, (1, 2, 3));
-    Ok(())
-}
-
-#[wasmtime_test]
-#[cfg_attr(miri, ignore)]
 fn call_wasm_to_native(config: &mut Config) -> Result<()> {
     let wasm = wat::parse_str(
         r#"
@@ -1749,6 +1720,72 @@ fn typed_concrete_param(config: &mut Config) -> wasmtime::Result<()> {
     Ok(())
 }
 
+#[wasmtime_test(wasm_features(gc, function_references))]
+#[cfg_attr(miri, ignore)]
+fn typed_concrete_gc_param_with_i31_and_none(config: &mut Config) -> wasmtime::Result<()> {
+    let engine = Engine::new(&config)?;
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+                (type $s (struct (field i32)))
+                (type $a (array i32))
+                (type $f (func))
+                (func (export "nullable-struct") (param (ref null $s)))
+                (func (export "struct") (param (ref $s)))
+                (func (export "array") (param (ref $a)))
+                (func (export "func") (param (ref $f)))
+            )
+        "#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    // `(ref null none)` is a subtype of every nullable struct and array type,
+    // so passing null is fine.
+    let f = instance.get_typed_func::<Option<NoneRef>, ()>(&mut store, "nullable-struct")?;
+    f.call(&mut store, None)?;
+
+    // however while `i31ref` is in the same type hierarchy as `(ref null
+    // $struct)` to get `f` here it fails the type-check at runtime.
+    let f = instance.get_typed_func::<Option<I31>, ()>(&mut store, "nullable-struct")?;
+    f.call(&mut store, None)?;
+    assert!(f.call(&mut store, I31::new_i32(7)).is_err());
+
+    // Similar to above, these types are all in the same hierarchy so getting
+    // `f` works but actually calling it should fail.
+    for name in ["struct", "array"] {
+        let f = instance.get_typed_func::<I31, ()>(&mut store, name)?;
+        assert!(f.call(&mut store, I31::new_i32(7).unwrap()).is_err());
+
+        let f = instance.get_typed_func::<Option<I31>, ()>(&mut store, name)?;
+        assert!(f.call(&mut store, None).is_err());
+
+        let f = instance.get_typed_func::<Option<NoneRef>, ()>(&mut store, name)?;
+        assert!(f.call(&mut store, None).is_err());
+    }
+
+    // outside of the type hierarchy entirely, however, just fails to get `f` to
+    // begin with.
+    assert!(
+        instance
+            .get_typed_func::<I31, ()>(&mut store, "func")
+            .is_err()
+    );
+    assert!(
+        instance
+            .get_typed_func::<Option<I31>, ()>(&mut store, "func")
+            .is_err()
+    );
+    assert!(
+        instance
+            .get_typed_func::<Option<NoneRef>, ()>(&mut store, "func")
+            .is_err()
+    );
+
+    Ok(())
+}
+
 #[wasmtime_test(wasm_features(function_references, bulk_memory))]
 #[cfg_attr(miri, ignore)]
 fn typed_concrete_result(config: &mut Config) -> wasmtime::Result<()> {
@@ -1846,10 +1883,9 @@ fn wrap_supertype_result() -> wasmtime::Result<()> {
     Ok(())
 }
 
-#[wasmtime_test(wasm_features(function_references))]
+#[wasmtime_test(wasm_features(gc, function_references))]
 #[cfg_attr(miri, ignore)]
 fn call_wasm_passing_subtype_func_param(config: &mut Config) -> wasmtime::Result<()> {
-    config.wasm_function_references(true);
     let engine = Engine::new(&config)?;
     let mut store = Store::new(&engine, ());
 
@@ -1857,7 +1893,7 @@ fn call_wasm_passing_subtype_func_param(config: &mut Config) -> wasmtime::Result
         &engine,
         r#"
             (module
-                (type $ty (func (result funcref)))
+                (type $ty (sub (func (result funcref))))
                 (func (export "f") (param (ref null $ty)) (result funcref)
                     ;; Return null if the funcref is null.
                     ref.null func
@@ -1876,6 +1912,8 @@ fn call_wasm_passing_subtype_func_param(config: &mut Config) -> wasmtime::Result
 
     let instance = Instance::new(&mut store, &module, &[])?;
     let f = instance.get_func(&mut store, "f").unwrap();
+    let ty = f.ty(&store).params().next().unwrap();
+    let ty = ty.unwrap_ref().heap_type().unwrap_concrete_func();
 
     let g_ty = FuncType::new(&engine, None, Some(ValType::I32));
     let g = Func::new(&mut store, g_ty.clone(), |_caller, _params, results| {
@@ -1883,17 +1921,19 @@ fn call_wasm_passing_subtype_func_param(config: &mut Config) -> wasmtime::Result
         Ok(())
     });
 
-    // h's type is a subtype of the Wasm-defined `$ty`:
+    // h's type is declared as a subtype of the Wasm-defined `$ty`:
     //
     //     (func (result (ref null g_ty))) <: (func (result funcref))
-    let h_ty = FuncType::new(
+    let h_ty = FuncType::with_finality_and_supertype(
         &engine,
-        None,
-        Some(ValType::Ref(RefType::new(
+        Finality::Final,
+        Some(ty),
+        [],
+        [ValType::Ref(RefType::new(
             true,
             HeapType::ConcreteFunc(g_ty),
-        ))),
-    );
+        ))],
+    )?;
     let h = Func::new(&mut store, h_ty, move |_caller, _params, results| {
         results[0] = Val::FuncRef(Some(g));
         Ok(())

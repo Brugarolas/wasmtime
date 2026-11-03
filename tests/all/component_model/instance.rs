@@ -1,6 +1,6 @@
 use wasmtime::Result;
 use wasmtime::component::*;
-use wasmtime::{Module, Store};
+use wasmtime::{Module, Store, StoreContextMut, Trap};
 
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -177,6 +177,117 @@ fn export_missing_get_max() -> Result<()> {
         let m = instance.get_module(&mut store, &m).unwrap();
         test_fn(&m);
     }
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn export_type_ascription_hides_exports() -> Result<()> {
+    let engine = super::engine();
+    let component = r#"
+        (component
+            (core module $m
+                (func (export "f") (result i32) i32.const 1)
+                (func (export "g") (result i32) i32.const 2))
+            (core instance $i (instantiate $m))
+            (func $f (result u32) (canon lift (core func $i "f")))
+            (func $g (result u32) (canon lift (core func $i "g")))
+            (instance $inst (export "f" (func $f)) (export "g" (func $g)))
+            (export "hidden" (instance $inst) (instance (export "f" (func (result u32)))))
+        )
+    "#;
+    let component = Component::new(&engine, component)?;
+
+    let ty = component.component_type();
+    let (_, hidden) = ty.exports(&engine).next().unwrap();
+    let types::ComponentItem::ComponentInstance(hidden) = hidden.ty else {
+        panic!("expected an instance export");
+    };
+    let names = hidden.exports(&engine).map(|(n, _)| n).collect::<Vec<_>>();
+    assert_eq!(names, ["f"]);
+
+    let hidden = component.get_export_index(None, "hidden").unwrap();
+    assert!(component.get_export_index(Some(&hidden), "g").is_none());
+
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let hidden = instance
+        .get_export_index(&mut store, None, "hidden")
+        .unwrap();
+    assert!(
+        instance
+            .get_export_index(&mut store, Some(&hidden), "g")
+            .is_none()
+    );
+    let f = instance
+        .get_export_index(&mut store, Some(&hidden), "f")
+        .unwrap();
+    let f = instance.get_typed_func::<(), (u32,)>(&mut store, &f)?;
+    assert_eq!(f.call(&mut store, ())?, (1,));
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn start_function_not_run_in_poisoned_store() -> Result<()> {
+    let engine = super::engine();
+
+    let trapper = Component::new(
+        &engine,
+        r#"
+(component
+  (core module $m (func (export "trap") unreachable))
+  (core instance $m (instantiate $m))
+  (func (export "trap") (canon lift (core func $m "trap")))
+)
+        "#,
+    )?;
+
+    // The start function calls a host import so we can observe whether it
+    // ran.
+    let starter = Component::new(
+        &engine,
+        r#"
+            (component
+              (import "ran" (func $ran))
+              (core func $ran_lower (canon lower (func $ran)))
+              (core module $m
+                (import "host" "ran" (func $ran))
+                (func $start call $ran)
+                (start $start)
+              )
+              (core instance (instantiate $m
+                (with "host" (instance (export "ran" (func $ran_lower))))
+              ))
+            )
+        "#,
+    )?;
+
+    let mut store = Store::new(&engine, false);
+    let mut linker = Linker::new(&engine);
+    linker
+        .root()
+        .func_wrap("ran", |mut store: StoreContextMut<'_, bool>, _: ()| {
+            *store.data_mut() = true;
+            Ok(())
+        })?;
+
+    // Poison the store with a trap.
+    let instance = linker.instantiate(&mut store, &trapper)?;
+    let trap = instance.get_typed_func::<(), ()>(&mut store, "trap")?;
+    assert!(trap.call(&mut store, ()).is_err());
+
+    // Instantiating into the poisoned store must fail without running the
+    // start function.
+    let err = linker.instantiate(&mut store, &starter).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<Trap>(),
+        Some(&Trap::CannotEnterComponent),
+        "{err:?}"
+    );
+    assert!(!*store.data(), "start function ran in a poisoned store");
 
     Ok(())
 }

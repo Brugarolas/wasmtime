@@ -19,14 +19,14 @@ use cranelift_codegen::{
 use smallvec::SmallVec;
 use std::marker::PhantomData;
 use wasmparser::{
-    BinaryReader, FuncValidator, MemArg, Operator, OperatorsReader, ValidatorResources,
-    VisitOperator, VisitSimdOperator, WasmFeatures,
+    BinaryReader, FuncValidator, MemArg, MemArgTarget, Operator, OperatorsReader,
+    ValidatorResources, VisitOperator, VisitSimdOperator, WasmFeatures,
 };
 use wasmtime_cranelift::{TRAP_BAD_SIGNATURE, TRAP_HEAP_MISALIGNED, TRAP_TABLE_OUT_OF_BOUNDS};
 use wasmtime_environ::{
-    DataIndex, ElemIndex, FUNCREF_INIT_BIT, FUNCREF_MASK, GlobalIndex, IndexType, MemoryIndex,
-    MemoryKind, MemoryTunables, PtrSize, TableIndex, Tunables, TypeIndex, WasmHeapType,
-    WasmValType, wasm_unsupported,
+    DataIndex, ElemIndex, FUNCREF_INIT_BIT, FUNCREF_MASK, FuncIndex, GlobalIndex, IndexType,
+    MemoryIndex, MemoryKind, MemoryTunables, PtrSize, TableIndex, Tunables, TypeIndex,
+    WasmHeapType, WasmValType, wasm_unsupported,
 };
 
 mod context;
@@ -548,6 +548,86 @@ where
         ty.is_vmgcref_type_and_not_i31()
             && self.tunables.collector
                 == Some(wasmtime_environ::Collector::DeferredReferenceCounting)
+    }
+
+    /// Emits a `ref.func` for the function `index`, pushing a pointer to its
+    /// `VMFuncRef` onto the value stack.
+    ///
+    /// This mirrors `FuncEnvironment::translate_ref_func` in Cranelift, see
+    /// there for more information.
+    pub fn emit_ref_func(&mut self, index: FuncIndex) -> Result<()> {
+        let ptr_type = self.env.ptr_type();
+        let ptr_size: OperandSize = ptr_type.try_into()?;
+        let module = &self.env.translation.module;
+        let dst = self.context.any_gpr(self.masm)?;
+
+        let Some(def_index) = module.defined_func_index(index) else {
+            // `VMFunctionImport` has the same layout as `VMFuncRef` and is
+            // fully initialized before any wasm runs.
+            let offset = self.env.vmoffsets.imported_functions().at(index);
+            self.masm.compute_addr(
+                self.masm.address_at_vmctx(offset)?,
+                writable!(dst),
+                ptr_size,
+            )?;
+            self.context.stack.push(TypedReg::new(ptr_type, dst).into());
+            return Ok(());
+        };
+
+        // Initialize the `VMFuncRef` for this defined function in place in
+        // the `vmctx`.
+        let func = &module.functions[index];
+        assert!(func.is_escaping());
+        let func_ref = self.env.vmoffsets.func_refs().at(func.func_ref);
+        let sig = func.signature.unwrap_module_type_index();
+        let sig_offset = self.env.shared_type_index_offset(sig);
+        let sig_size = OperandSize::from_bytes(self.env.vmoffsets.size_of_vmshared_type_index());
+        let type_ids = self.env.vmoffsets.ptr.vmctx().type_ids();
+        let fields = self.env.vmoffsets.ptr.vm_func_ref();
+        let array_call = func_ref + u32::from(fields.array_call());
+        let wasm_call = func_ref + u32::from(fields.wasm_call());
+        let vmctx_field = func_ref + u32::from(fields.vmctx());
+        let type_index = func_ref + u32::from(fields.type_index());
+        let array_name = self.env.name_array_to_wasm_trampoline(def_index);
+        let wasm_name = self.env.name_wasm(def_index);
+
+        self.masm.with_scratch::<IntScratch, _>(|masm, scratch| {
+            masm.load_func_addr(array_name, scratch.writable())?;
+            masm.store(
+                scratch.inner().into(),
+                masm.address_at_vmctx(array_call)?,
+                ptr_size,
+            )?;
+            masm.load_func_addr(wasm_name, scratch.writable())?;
+            masm.store(
+                scratch.inner().into(),
+                masm.address_at_vmctx(wasm_call)?,
+                ptr_size,
+            )?;
+            masm.store(
+                vmctx!(M).into(),
+                masm.address_at_vmctx(vmctx_field)?,
+                ptr_size,
+            )?;
+            masm.load_ptr(masm.address_at_vmctx(type_ids.into())?, scratch.writable())?;
+            masm.load(
+                masm.address_at_reg(scratch.inner(), sig_offset)?,
+                scratch.writable(),
+                sig_size,
+            )?;
+            masm.store(
+                scratch.inner().into(),
+                masm.address_at_vmctx(type_index)?,
+                sig_size,
+            )
+        })?;
+        self.masm.compute_addr(
+            self.masm.address_at_vmctx(func_ref)?,
+            writable!(dst),
+            ptr_size,
+        )?;
+        self.context.stack.push(TypedReg::new(ptr_type, dst).into());
+        Ok(())
     }
 
     /// Emits a a series of instructions that will type check a function reference call.
@@ -1447,6 +1527,9 @@ where
         memarg: &MemArg,
         access_size: OperandSize,
     ) -> Result<Option<Reg>> {
+        if memarg.ordering.is_some() {
+            bail!(wasm_unsupported!("acquire-release-atomics"));
+        }
         self.emit_check_align(heap, memarg, access_size)?;
         self.emit_compute_heap_address(heap, memarg, access_size)
     }
@@ -1468,7 +1551,7 @@ where
             Ok(())
         };
 
-        let memory_index = MemoryIndex::from_u32(arg.memory);
+        let memory_index = memarg_memory_index(arg)?;
         let heap = self.env.resolve_heap(memory_index);
 
         // Ensure that the destination register is not allocated if
@@ -1515,7 +1598,7 @@ where
 
     /// Emit a WebAssembly store.
     pub fn emit_wasm_store(&mut self, arg: &MemArg, kind: StoreKind) -> Result<()> {
-        let memory_index = MemoryIndex::from_u32(arg.memory);
+        let memory_index = memarg_memory_index(arg)?;
         let heap = self.env.resolve_heap(memory_index);
         let src = self.context.pop_to_reg(self.masm, None)?;
 
@@ -2465,7 +2548,7 @@ where
         size: OperandSize,
         extend: Option<Extend<Zero>>,
     ) -> Result<()> {
-        let memory_index = MemoryIndex::from_u32(arg.memory);
+        let memory_index = memarg_memory_index(arg)?;
         let heap = self.env.resolve_heap(memory_index);
         // We need to pop-push the operand to compute the address before passing control over to
         // masm, because some architectures may have specific requirements for the registers used
@@ -2523,7 +2606,7 @@ where
         let replacement = self.context.pop_to_reg(self.masm, None)?;
         let expected = self.context.pop_to_reg(self.masm, None)?;
 
-        let memory_index = MemoryIndex::from_u32(arg.memory);
+        let memory_index = memarg_memory_index(arg)?;
         let heap = self.env.resolve_heap(memory_index);
         if let Some(addr) = self.emit_compute_heap_address_align_checked(&heap, arg, size)? {
             self.context
@@ -2567,11 +2650,8 @@ where
             AtomicWaitKind::Wait32 => self.env.builtins.memory_atomic_wait32::<M::ABI>()?,
             AtomicWaitKind::Wait64 => self.env.builtins.memory_atomic_wait64::<M::ABI>()?,
         };
-        let builtin = self.prepare_builtin_defined_memory_arg(
-            MemoryIndex::from_u32(arg.memory),
-            stack_len,
-            builtin,
-        )?;
+        let builtin =
+            self.prepare_builtin_defined_memory_arg(memarg_memory_index(arg)?, stack_len, builtin)?;
 
         if arg.offset != 0 {
             self.masm.checked_uadd(
@@ -2612,11 +2692,8 @@ where
         // Put the target memory index as the first argument.
         let builtin = self.env.builtins.memory_atomic_notify::<M::ABI>()?;
         let stack_len = self.context.stack.len();
-        let builtin = self.prepare_builtin_defined_memory_arg(
-            MemoryIndex::from_u32(arg.memory),
-            stack_len,
-            builtin,
-        )?;
+        let builtin =
+            self.prepare_builtin_defined_memory_arg(memarg_memory_index(arg)?, stack_len, builtin)?;
 
         if arg.offset != 0 {
             self.masm.checked_uadd(
@@ -2715,4 +2792,17 @@ pub fn control_index(depth: u32, control_length: usize) -> Result<usize> {
     (control_length - 1)
         .checked_sub(depth as usize)
         .ok_or_else(|| format_err!(CodeGenError::control_frame_expected()))
+}
+
+/// Returns the linear memory targeted by the given `MemArg`.
+///
+/// Note that winch doesn't support the multibyte-array-access proposal at this
+/// time hence this helper to return an error if that shows up.
+fn memarg_memory_index(memarg: &MemArg) -> Result<MemoryIndex> {
+    match memarg.target {
+        MemArgTarget::Memory(index) => Ok(MemoryIndex::from_u32(index)),
+        MemArgTarget::Array(_) => Err(format_err!(wasm_unsupported!(
+            "multibyte-array-access proposal"
+        ))),
+    }
 }

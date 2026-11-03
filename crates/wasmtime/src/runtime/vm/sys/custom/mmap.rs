@@ -1,6 +1,6 @@
 use super::cvt;
 use crate::prelude::*;
-use crate::runtime::vm::sys::{capi, vm::MemoryImageSource};
+use crate::runtime::vm::sys::capi;
 use crate::runtime::vm::{HostAlignedByteCount, SendSyncPtr};
 use core::ops::Range;
 use core::ptr::{self, NonNull};
@@ -78,71 +78,34 @@ impl Mmap {
         self.memory.as_ptr().len()
     }
 
+    unsafe fn change_protections(&self, range: Range<usize>, permissions: u32) -> Result<()> {
+        let base = unsafe { self.memory.as_ptr().byte_add(range.start).cast() };
+        let len = range.end - range.start;
+
+        unsafe { cvt(capi::wasmtime_mprotect(base, len, permissions)) }
+    }
+
     pub unsafe fn make_executable(
         &self,
         range: Range<usize>,
         enable_branch_protection: bool,
     ) -> Result<()> {
-        unsafe {
-            let base = self.memory.as_ptr().byte_add(range.start).cast();
-            let len = range.end - range.start;
+        // not mapped into the C API at this time.
+        let _ = enable_branch_protection;
 
-            // not mapped into the C API at this time.
-            let _ = enable_branch_protection;
-
-            cvt(capi::wasmtime_mprotect(
-                base,
-                len,
-                capi::PROT_READ | capi::PROT_EXEC,
-            ))?;
-        }
-        Ok(())
+        unsafe { self.change_protections(range, capi::PROT_READ | capi::PROT_EXEC) }
     }
 
     pub unsafe fn make_readonly(&self, range: Range<usize>) -> Result<()> {
-        unsafe {
-            let base = self.memory.as_ptr().byte_add(range.start).cast();
-            let len = range.end - range.start;
-
-            cvt(capi::wasmtime_mprotect(base, len, capi::PROT_READ))?;
-        }
-        Ok(())
+        unsafe { self.change_protections(range, capi::PROT_READ) }
     }
 
     pub unsafe fn make_readwrite(&self, range: Range<usize>) -> Result<()> {
-        unsafe {
-            let base = self.memory.as_ptr().byte_add(range.start).cast();
-            let len = range.end - range.start;
-
-            cvt(capi::wasmtime_mprotect(
-                base,
-                len,
-                capi::PROT_READ | capi::PROT_WRITE,
-            ))?;
-        }
-        Ok(())
+        unsafe { self.change_protections(range, capi::PROT_READ | capi::PROT_WRITE) }
     }
 
-    pub unsafe fn map_image_at(
-        &self,
-        image_source: &MemoryImageSource,
-        source_offset: u64,
-        memory_offset: HostAlignedByteCount,
-        memory_len: HostAlignedByteCount,
-    ) -> Result<()> {
-        assert_eq!(source_offset, 0);
-        unsafe {
-            let base = self
-                .memory
-                .as_ptr()
-                .byte_add(memory_offset.byte_count())
-                .cast();
-            cvt(capi::wasmtime_memory_image_map_at(
-                image_source.image_ptr().as_ptr(),
-                base,
-                memory_len.byte_count(),
-            ))
-        }
+    pub unsafe fn make_inaccessible(&self, range: Range<usize>) -> Result<()> {
+        unsafe { self.change_protections(range, 0) }
     }
 }
 

@@ -166,6 +166,7 @@ pub mod __internal {
     pub use crate::map_maybe_uninit;
     pub use crate::store::StoreOpaque;
     pub use alloc::boxed::Box;
+    pub use alloc::collections::BTreeMap;
     pub use alloc::string::String;
     pub use alloc::vec::Vec;
     pub use core::cell::RefCell;
@@ -271,11 +272,28 @@ pub(crate) use self::store::ComponentStoreData;
 ///     // functionality per-function or by default for all imports. Note that
 ///     // exports are also supported via the `exports` key below.
 ///     //
-///     // Functions in this list are specified as their interface first then
-///     // the raw wasm name of the function. Interface versions can be
-///     // optionally omitted and prefixes are also supported to configure
-///     // entire interfaces at once for example. Only the first matching item
-///     // in this list is used to configure a function.
+///     // Each key names either one function or a group of functions:
+///     //
+///     // * `"my-func"` - a function imported directly by the world.
+///     // * `"wasi:io/poll.poll"` - the `poll` function in the `wasi:io/poll`
+///     //   interface. A version is optional: `"wasi:io/poll@0.2.0.poll"`.
+///     // * `"wasi:io/poll"` - every function in the `wasi:io/poll` interface.
+///     // * `"wasi:io"` or `"wasi"` - every function in a package or namespace.
+///     //
+///     // Resource functions are named by their component-model name, written
+///     // after the interface:
+///     //
+///     // * `"my:local/api.[constructor]my-resource"`
+///     // * `"my:local/api.[method]my-resource.my-method"`
+///     // * `"my:local/api.[static]my-resource.my-static-func"`
+///     // * `"my:local/api.[drop]my-resource"`
+///     //
+///     // A resource name on its own (`"my:local/api.my-resource"`) isn't a valid
+///     // key. List each resource function by itself, or use the interface key
+///     // to cover all of them.
+///     //
+///     // When more than one key matches a function, the most specific one is
+///     // used and the rest are ignored for that function.
 ///     //
 ///     // Configuration for a function is a set of flags which can be added
 ///     // per-function. Each flag's meaning is documented below and the final
@@ -352,6 +370,18 @@ pub(crate) use self::store::ComponentStoreData;
 ///         // host function return `wasmtime::Result<Result<WitOk, WitErr>>`
 ///         // for example and instead return `Result<WitOk, RustErrorType>`.
 ///         "my:local/api.fallible": trappable,
+///
+///         // Resource methods, constructors, and static functions are
+///         // configured with their `[method]`, `[constructor]`, `[drop]`, or `[static]`
+///         // name as described above.
+///         //
+///         // Note that if one resource method specifies a flag, the remaining resource methods
+///         // are no longer covered by e.g. `default: trappable`, and must be flagged
+///         // individually.
+///         "my:local/api.[method]my-resource.my-method": async | trappable,
+///         "my:local/api.[static]my-resource.my-static-func": trappable,
+///         "my:local/api.[constructor]my-resource": trappable,
+///         "my:local/api.[drop]my-resource": trappable,
 ///
 ///         // The `exact` flag ensures that the filter, here "f", only matches
 ///         // functions exactly. For example "f" here would only refer to
@@ -451,11 +481,12 @@ pub(crate) use self::store::ComponentStoreData;
 ///     // interfaces, used together with the component model's
 ///     // `(implements "...")` annotation.
 ///     //
-///     // For each interface listed here an extra `Host` trait is generated
-///     // under a top-level `named_imports` module (mirroring the interface's
-///     // normal module path) whose methods each take an additional first
-///     // argument: a reference to the host-chosen "id" type given as the value
-///     // (here `MyHandlerId`). Alongside the trait a reflection-based
+///     // Each key must name an interface that the world imports. For each
+///     // one an extra `Host` trait is generated under a top-level
+///     // `named_imports` module (mirroring the interface's normal module
+///     // path) whose methods each take an additional first argument: the
+///     // host-chosen "id" type given as the value (here `MyHandlerId`),
+///     // passed by value. Alongside the trait a reflection-based
 ///     // `add_to_linker` is generated:
 ///     //
 ///     // ```ignore
@@ -467,15 +498,27 @@ pub(crate) use self::store::ComponentStoreData;
 ///     // ) -> Result<()>;
 ///     // ```
 ///     //
-///     // This inspects `component`'s imports, and for each one annotated with
-///     // `(implements "wasi:http/handler")` calls `lookup` with the import's
-///     // name to obtain an id. That id is then cloned into each linker closure
-///     // and passed as the first argument to every method call, letting a
-///     // single `Host` implementation distinguish between multiple imports
-///     // of the same interface.
+///     // This inspects `component`'s imports, and for each one whose
+///     // `(implements "...")` annotation matches `wasi:http/handler` calls
+///     // `lookup` with the import's name to obtain an id. Matching uses
+///     // `ComponentExtern::is_implements`, so semver-compatible versions also
+///     // match. The id is then cloned for each call and passed as the first
+///     // argument to every method, letting a single `Host` implementation
+///     // distinguish between multiple imports of the same interface. To bind a
+///     // single import instead, the generated `add_to_linker_instance` takes a
+///     // `LinkerInstance`, such as `linker.instance("my-handler")?`, and the
+///     // id to use for it.
 ///     //
-///     // The id type must be `Clone + Send + Sync + 'static`. Interfaces that
-///     // define a resource are not supported here and cause a compile error.
+///     // The id type must be `Clone + Send + Sync + 'static`.
+///     //
+///     // As with `with`, a key without a version applies to every version of
+///     // the interface imported by the world, and a key with a version takes
+///     // precedence over one without.
+///     //
+///     // Without this option the host can only load components whose
+///     // imports match the shape of the world given to `bindgen!`. With it,
+///     // the host can also load components which import the listed
+///     // interfaces under any names of their choosing.
 ///     named_imports: {
 ///         "wasi:http/handler": MyHandlerId,
 ///     },
@@ -488,6 +531,12 @@ pub(crate) use self::store::ComponentStoreData;
 ///         serde::Deserialize,
 ///         serde::Serialize,
 ///     ],
+///
+///     // The Rust type to use for WIT `map<K, V>` types: `BTreeMap`,
+///     // `std::collections::HashMap`, or `indexmap::IndexMap`.
+///     //
+///     // By default this is `BTreeMap`.
+///     map_type: std::collections::HashMap,
 ///
 ///     // An niche configuration option to require that the `T` in `Store<T>`
 ///     // is always `Send` in the generated bindings. Typically not needed

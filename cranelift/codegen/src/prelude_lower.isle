@@ -113,7 +113,7 @@
 (extern constructor output_vec output_vec)
 
 ;; Get a temporary register for writing.
-(spec (temp_writable_reg ty) (provide (= (:bits ty) (widthof result))))
+(spec (temp_writable_reg ty) (provide (= (:bits ty) (widthof result)) (= (:lanes ty) (lanesof result))))
 (decl temp_writable_reg (Type) WritableReg)
 (extern constructor temp_writable_reg temp_writable_reg)
 
@@ -276,7 +276,10 @@
            (value_list_slice (value_slice_unwrap head1 (value_slice_unwrap head2 tail))))
 
 ;; Turn a `Writable<Reg>` into a `Reg` via `Writable::to_reg`.
-(spec (writable_reg_to_reg reg) (provide (= result reg)))
+;; `Reg` is modeled with 64 bits, but a temporary may be allocated with a wider
+;; type, for example a 128-bit vector register for a scalar floating-point
+;; value. Only the low bits are modeled in that case.
+(spec (writable_reg_to_reg reg) (provide (= result (conv_to (widthof result) reg))))
 (decl pure writable_reg_to_reg (WritableReg) Reg)
 (extern constructor writable_reg_to_reg writable_reg_to_reg)
 
@@ -340,7 +343,7 @@
 (spec (has_type ty arg)
       (provide
             (= result arg)
-            (= (:bits ty) (widthof arg))))
+            (= (:bits ty) (widthof arg)) (= (:lanes ty) (lanesof arg))))
 (decl has_type (Type Inst) Inst)
 (extractor (has_type ty inst)
            (and (result_type ty)

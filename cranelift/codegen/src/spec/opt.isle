@@ -19,13 +19,16 @@
 (spec (simplify arg)
     (provide
         (if relax_nan
-            (fp_equiv! result arg)
+            (all_lanes ((result result) (arg arg)) (fp_equiv! result arg))
             (= result arg))))
 (instantiate simplify
     ((args (bv  8)) (ret (bv  8)))
     ((args (bv 16)) (ret (bv 16)))
     ((args (bv 32)) (ret (bv 32)))
-    ((args (bv 64)) (ret (bv 64))))
+    ((args (bv 64)) (ret (bv 64)))
+    ;; Canary vector shapes to catch missing scalar guards.
+    ((args (bv 32 x 2)) (ret (bv 32 x 2)))
+    ((args (bv 8 x 4)) (ret (bv 8 x 4))))
 
 ;; `remat` and `subsume` annotate a rewrite without changing the value.
 (spec (remat x) (provide (= result x)))
@@ -66,16 +69,20 @@
 ;; extractors they yield the constant `c` as the zero/sign-extension of the
 ;; matched value to 64 bits, mirroring the `iconst` spec.
 (spec (iconst_u ty c)
+    (require (or (= (:lanes ty) 1) (= (:bits ty) 128)))
     (provide (= c (zero_ext 64 result))
-             (= (:bits ty) (widthof result))))
+             (= (:bits ty) (widthof result))
+             (= (:lanes ty) (lanesof result))))
 (instantiate iconst_u
     ((args (named Type) (bv 64)) (ret (bv 8)))
     ((args (named Type) (bv 64)) (ret (bv 16)))
     ((args (named Type) (bv 64)) (ret (bv 32)))
     ((args (named Type) (bv 64)) (ret (bv 64))))
 (spec (iconst_s ty c)
+    (require (or (= (:lanes ty) 1) (= (:bits ty) 128)))
     (provide (= c (sign_ext 64 result))
-             (= (:bits ty) (widthof result))))
+             (= (:bits ty) (widthof result))
+             (= (:lanes ty) (lanesof result))))
 (instantiate iconst_s
     ((args (named Type) (bv 64)) (ret (bv 8)))
     ((args (named Type) (bv 64)) (ret (bv 16)))
@@ -126,7 +133,10 @@
 (spec (u64_lt x y) (provide (= result (bvult x y))))
 (spec (imm64 x) (provide (= result x)))
 
-(spec (cmp_true ty) (provide (= result (zero_ext (widthof result) #b1))))
+(spec (cmp_true ty)
+    (provide (= result (zero_ext (widthof result) #b1))
+             (= (:bits ty) (widthof result))
+             (= (:lanes ty) (lanesof result))))
 (instantiate cmp_true
     ((args (named Type)) (ret (bv  8)))
     ((args (named Type)) (ret (bv 16)))
@@ -137,7 +147,8 @@
 ;; rather than chaining.
 (spec (all_zero ty)
     (provide (= result (bvzero! (widthof result)))
-             (= (:bits ty) (widthof result))))
+             (= (:bits ty) (widthof result))
+             (= (:lanes ty) (lanesof result))))
 (instantiate all_zero
     ((args (named Type)) (ret (bv  8)))
     ((args (named Type)) (ret (bv 16)))
@@ -155,8 +166,10 @@
 ;; it yields the inner `val`, with the outer being the zero-extension of the
 ;; inner to `ty` bits. Mirrors `maybe_uextend`.
 (spec (uextend_maybe ty val)
+    (require (= (:lanes ty) 1))
     (provide (= result (zero_ext (widthof result) val))
-             (= (:bits ty) (widthof result))))
+             (= (:bits ty) (widthof result))
+             (= (:lanes ty) (lanesof result))))
 
 ;; The rule `(uextend_maybe ty val) => (uextend ty val)` needs concrete widths to
 ;; type-check standalone (its spec leaves `val`'s width free). Unlike `uextend`,
@@ -176,8 +189,10 @@
 
 ;; Same as `uextend_maybe` but with sign extension.
 (spec (sextend_maybe ty val)
+    (require (= (:lanes ty) 1))
     (provide (= result (sign_ext (widthof result) val))
-             (= (:bits ty) (widthof result))))
+             (= (:bits ty) (widthof result))
+             (= (:lanes ty) (lanesof result))))
 (instantiate sextend_maybe
     ((args (named Type) (bv  8)) (ret (bv  8)))
     ((args (named Type) (bv  8)) (ret (bv 16)))
@@ -558,14 +573,16 @@
 ;; Partial: half-width integer type (i16->i8, ...); undefined for i8.
 (spec (ty_half_width ty)
     (match (bvuge (int2bv 64 (:bits ty)) (int2bv 64 16)))
-    (provide (= (int2bv 64 (:bits result)) (bvlshr (int2bv 64 (:bits ty)) (int2bv 64 1)))))
+    (provide (= (int2bv 64 (:bits result)) (bvlshr (int2bv 64 (:bits ty)) (int2bv 64 1)))
+             (= (:lanes result) (:lanes ty))))
 (spec (ty_equal lhs rhs) (provide (= result (= lhs rhs))))
 
 ;; Partial: bit width (8/16/32) -> that integer type.
 (spec (shift_amt_to_type v)
     (match (or (= v (int2bv 64 8)) (= v (int2bv 64 16)) (= v (int2bv 64 32))))
     (provide (= (:bits result)
-                (if (= v (int2bv 64 8)) 8 (if (= v (int2bv 64 16)) 16 32)))))
+                (if (= v (int2bv 64 8)) 8 (if (= v (int2bv 64 16)) 16 32)))
+             (= (:lanes result) 1)))
 
 ;;;; `imm64_*` min/max/shift folding ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; 64-bit `Imm64`, masked to the low `ty` bits. Signed ops sign-extend those bits
@@ -713,7 +730,13 @@
             ((SignedGreaterThanOrEqual) (int2bv 64 5))
             ((NotEqual) (int2bv 64 6))))))
 (macro (icmp_bit c) (if c #x01 #x00))
-(spec (compose_icmp ty v signed x y)
+(spec (compose_icmp rty ty v signed x y)
+    ;; `compose_icmp` is verified as a root term, so the operand type tie is a
+    ;; requirement (assumed here, discharged at the `band`/`bor` call sites).
+    ;; `rty` only selects the constant's type; the result width comes from the
+    ;; instantiation.
+    (require (= (:bits ty) (widthof x))
+             (= (:lanes ty) (lanesof x)))
     (provide (= result
         (if (= v (int2bv 64 0)) #x00
         (if (= v (int2bv 64 1)) (icmp_bit! (= x y))
@@ -724,19 +747,27 @@
         (if (= v (int2bv 64 6)) (icmp_bit! (not (= x y)))
         #x01))))))))))
 
-;; Reached only at `ty = I8` (icmp results are `(bv 8)`), so all operands/result bv8.
+;; `rty` is the comparison's result type (`i8`), `ty` its operand type.
 (instantiate compose_icmp
-    ((args (named Type) (bv 64) Bool (bv 8) (bv 8)) (ret (bv 8))))
+    ((args (named Type) (named Type) (bv 64) Bool (bv  8) (bv  8)) (ret (bv 8)))
+    ((args (named Type) (named Type) (bv 64) Bool (bv 16) (bv 16)) (ret (bv 8)))
+    ((args (named Type) (named Type) (bv 64) Bool (bv 32) (bv 32)) (ret (bv 8)))
+    ((args (named Type) (named Type) (bv 64) Bool (bv 64) (bv 64)) (ret (bv 8))))
 
 ;;;; Bit-manipulation instructions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; `bitrev` = `rev`. `bmask` broadcasts truthiness to an all-ones/all-zeros mask of
 ;; the (possibly different-width) result type.
 (spec (bitrev ty x)
-    (provide (= result (rev x)) (= (:bits ty) (widthof result))))
-(instantiate bitrev bv_unary_8_to_64)
+    (require (= (:lanes ty) 1))
+    (provide (= result (rev x))
+             (= (:bits ty) (widthof result))
+             (= (:lanes ty) (lanesof result))))
+(instantiate bitrev bv_unary_scalar_8_to_64)
 (spec (bmask ty v)
+    (require (= (:lanes ty) 1))
     (provide (= result (if (bv_is_zero! v) (bvzero! (widthof result)) (bvones! (widthof result))))
-             (= (:bits ty) (widthof result))))
+             (= (:bits ty) (widthof result))
+             (= (:lanes ty) (lanesof result))))
 (instantiate bmask
     ((args (named Type) (bv  8)) (ret (bv  8)))
     ((args (named Type) (bv  8)) (ret (bv 16)))

@@ -24,13 +24,13 @@ use cranelift_codegen::ir::ExceptionTag;
 use regalloc2::RegClass;
 use smallvec::{SmallVec, smallvec};
 use wasmparser::{
-    BlockType, BrTable, HeapType, Ieee32, Ieee64, MemArg, TryTable, V128, ValType, VisitOperator,
-    VisitSimdOperator,
+    BlockType, BrTable, HeapType, Ieee32, Ieee64, MemArg, Ordering, TryTable, V128, ValType,
+    VisitOperator, VisitSimdOperator,
 };
 use wasmtime_cranelift::TRAP_INDIRECT_CALL_TO_NULL;
 use wasmtime_environ::{
     DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex, TypeConvert,
-    TypeIndex, WasmCompositeInnerType, WasmHeapType, WasmValType,
+    TypeIndex, WasmCompositeInnerType, WasmHeapType, WasmValType, wasm_unsupported,
 };
 
 /// A macro to define unsupported WebAssembly operators.
@@ -2310,14 +2310,7 @@ where
     }
 
     fn visit_ref_func(&mut self, function_index: u32) -> Self::Output {
-        let ref_func = self.env.builtins.ref_func::<M::ABI>()?;
-        self.context.stack.extend([function_index.try_into()?]);
-        FnCall::emit::<M>(
-            &mut self.env,
-            self.masm,
-            &mut self.context,
-            Callee::Builtin(ref_func),
-        )
+        self.emit_ref_func(FuncIndex::from_u32(function_index))
     }
 
     fn visit_i32_load(&mut self, memarg: MemArg) -> Self::Output {
@@ -3011,7 +3004,10 @@ where
         self.emit_atomic_notify(&arg)
     }
 
-    fn visit_atomic_fence(&mut self) -> Self::Output {
+    fn visit_atomic_fence(&mut self, ordering: Ordering) -> Self::Output {
+        if ordering != Ordering::SeqCst {
+            bail!(wasm_unsupported!("acquire-release-atomics"));
+        }
         self.masm.fence()
     }
 

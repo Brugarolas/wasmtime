@@ -4,83 +4,7 @@ use super::REALLOC_AND_FREE;
 use std::ops::Deref;
 use wasmtime::Result;
 use wasmtime::component::*;
-use wasmtime::{Config, Engine, Store, StoreContextMut, WasmBacktrace};
-
-#[test]
-fn can_compile() -> Result<()> {
-    let engine = super::engine();
-    let libc = r#"
-        (core module $libc
-            (memory (export "memory") 1)
-            (func (export "realloc") (param i32 i32 i32 i32) (result i32)
-                unreachable)
-        )
-        (core instance $libc (instantiate $libc))
-    "#;
-    Component::new(
-        &engine,
-        r#"(component
-            (import "a" (func $f))
-            (core func (canon lower (func $f)))
-        )"#,
-    )?;
-    Component::new(
-        &engine,
-        format!(
-            r#"(component
-                (import "a" (func $f (param "a" string)))
-                {libc}
-                (core func (canon lower (func $f) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
-            )"#
-        ),
-    )?;
-    Component::new(
-        &engine,
-        format!(
-            r#"(component
-                (import "f1" (func $f1 (param "a" string) (result string)))
-                {libc}
-                (core func (canon lower (func $f1) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
-
-                (import "f2" (func $f2 (param "a" u32) (result (list u8))))
-                (core instance $libc2 (instantiate $libc))
-                (core func (canon lower (func $f2) (memory (core memory $libc2 "memory")) (realloc (core func $libc2 "realloc"))))
-
-                (core func (canon lower (func $f1) (memory (core memory $libc2 "memory")) (realloc (core func $libc2 "realloc"))))
-                (core func (canon lower (func $f2) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
-            )"#
-        ),
-    )?;
-    Component::new(
-        &engine,
-        format!(
-            r#"(component
-                (import "log" (func $log (param "a" string)))
-                {libc}
-                (core func $log_lower (canon lower (func $log) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
-
-                (core module $logger
-                    (import "host" "log" (func $log (param i32 i32)))
-                    (import "libc" "memory" (memory 1))
-
-                    (func (export "call")
-                        i32.const 0
-                        i32.const 0
-                        call $log)
-                )
-                (core instance $logger (instantiate $logger
-                    (with "host" (instance (export "log" (func $log_lower))))
-                    (with "libc" (instance $libc))
-                ))
-
-                (func (export "call")
-                    (canon lift (core func $logger "call"))
-                )
-            )"#
-        ),
-    )?;
-    Ok(())
-}
+use wasmtime::{Config, Engine, Store, StoreContextMut, Trap, WasmBacktrace};
 
 #[test]
 fn simple() -> Result<()> {
@@ -477,6 +401,63 @@ fn reenter_during_host() -> Result<()> {
     let func = instance.get_func(&mut store, "run").unwrap();
     store.data_mut().func = Some(func);
     func.call(&mut store, &[], &mut [])?;
+
+    Ok(())
+}
+
+#[test]
+fn reenter_during_host_and_trap() -> Result<()> {
+    let component = r#"
+(component
+  (import "thunk" (func $thunk))
+  (core func $thunk_lower (canon lower (func $thunk)))
+
+  (core module $m
+    (import "host" "thunk" (func $thunk))
+
+    (func (export "run")
+      call $thunk
+      unreachable)
+    (func (export "trap")
+      unreachable)
+  )
+  (core instance $m (instantiate $m
+    (with "host" (instance (export "thunk" (func $thunk_lower))))
+  ))
+
+  (func (export "run")
+    (canon lift (core func $m "run"))
+  )
+  (func (export "trap")
+    (canon lift (core func $m "trap"))
+  )
+)
+    "#;
+
+    let engine = super::engine();
+    let component = Component::new(&engine, component)?;
+
+    // The host handles the reentrant call's trap and returns normally, but
+    // the store is now poisoned so the guest must not continue running.
+    let mut store = Store::new(&engine, None);
+    let mut linker = Linker::new(&engine);
+    linker.root().func_wrap(
+        "thunk",
+        |mut store: StoreContextMut<'_, Option<TypedFunc<(), ()>>>, _: ()| -> Result<()> {
+            let func = store.data().unwrap();
+            assert!(func.call(&mut store, ()).is_err());
+            Ok(())
+        },
+    )?;
+    let instance = linker.instantiate(&mut store, &component)?;
+    let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+    *store.data_mut() = Some(instance.get_typed_func::<(), ()>(&mut store, "trap")?);
+    let err = run.call(&mut store, ()).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<Trap>(),
+        Some(&Trap::CannotEnterComponent),
+        "{err:?}"
+    );
 
     Ok(())
 }

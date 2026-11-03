@@ -17,11 +17,7 @@ use crate::memory::MemoryCreator;
 #[cfg(feature = "runtime")]
 use crate::profiling_agent::{self, ProfilingAgent};
 #[cfg(feature = "runtime")]
-use crate::runtime::vm::{
-    GcRuntime, InstanceAllocator, OnDemandInstanceAllocator, RuntimeMemoryCreator,
-};
-#[cfg(feature = "runtime")]
-use crate::trampoline::MemoryCreatorProxy;
+use crate::runtime::vm::{GcRuntime, InstanceAllocator, OnDemandInstanceAllocator};
 
 #[cfg(feature = "async")]
 use crate::stack::{StackCreator, StackCreatorProxy};
@@ -168,7 +164,7 @@ pub struct Config {
     #[cfg(feature = "cache")]
     pub(crate) cache: Option<Cache>,
     #[cfg(feature = "runtime")]
-    pub(crate) mem_creator: Option<Arc<dyn RuntimeMemoryCreator>>,
+    pub(crate) mem_creator: Option<Arc<dyn MemoryCreator>>,
     #[cfg(feature = "runtime")]
     pub(crate) custom_code_memory: Option<Arc<dyn CustomCodeMemory>>,
     pub(crate) allocation_strategy: InstanceAllocationStrategy,
@@ -1127,6 +1123,11 @@ impl Config {
     /// On x86_64 platforms the base CPU feature requirement for SIMD
     /// is SSE2 for the Cranelift compiler and AVX for the Winch compiler.
     ///
+    /// On riscv64 the Cranelift compiler requires the `has_v` (or
+    /// `has_zvl128b`) setting for SIMD, which is not detected when
+    /// [`Config::target`] is used. Without it creating an [`Engine`] fails
+    /// unless this option and [`Config::wasm_relaxed_simd`] are disabled.
+    ///
     /// This is `true` by default.
     ///
     /// [proposal]: https://github.com/webassembly/simd
@@ -1154,6 +1155,10 @@ impl Config {
     /// the [`Config::relaxed_simd_deterministic`] option which will force
     /// deterministic behavior across all platforms, as classified by the
     /// specification, at the cost of performance.
+    ///
+    /// On riscv64 the Cranelift compiler requires the `has_v` (or
+    /// `has_zvl128b`) setting for relaxed SIMD. Without it creating an
+    /// [`Engine`] fails unless this option is disabled.
     ///
     /// This is `true` by default.
     ///
@@ -1415,6 +1420,9 @@ impl Config {
         self
     }
 
+    /// Configures whether the component model `(implements "...")` and
+    /// `(external-id "...")` name annotations are enabled.
+    ///
     /// This corresponds to the 🏷️ emoji in the component model specification.
     ///
     /// Please note that Wasmtime's support for this feature is a work in
@@ -1746,7 +1754,7 @@ impl Config {
     /// creating instance linear memories for the on-demand instance allocation strategy.
     #[cfg(feature = "runtime")]
     pub fn with_host_memory(&mut self, mem_creator: Arc<dyn MemoryCreator>) -> &mut Self {
-        self.mem_creator = Some(Arc::new(MemoryCreatorProxy(mem_creator)));
+        self.mem_creator = Some(mem_creator);
         self
     }
 
@@ -3196,7 +3204,24 @@ impl Config {
 
         compiler.wmemcheck(self.compiler_config_mut().wmemcheck);
 
-        Ok((self, compiler.build()?))
+        let compiler = compiler.build()?;
+
+        // SIMD support can depend on ISA flags, such as `has_v` on riscv64,
+        // which aren't known until now, so it's checked here and not in
+        // `compiler_panicking_wasm_features`.
+        if !compiler.supports_wasm_simd() {
+            let simd = WasmFeatures::SIMD | WasmFeatures::RELAXED_SIMD;
+            if let Some((name, _)) = (features & simd).iter_names().next() {
+                bail!(
+                    "the wasm_{} feature is not supported on this compiler \
+                     configuration, enable the target's vector extension or \
+                     disable both simd and relaxed-simd",
+                    name.to_lowercase()
+                );
+            }
+        }
+
+        Ok((self, compiler))
     }
 
     /// Internal setting for whether adapter modules for components will have

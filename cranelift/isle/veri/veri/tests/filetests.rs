@@ -43,8 +43,17 @@ fn pass(test_file: &str) {
 
 #[file_tests(path = "filetests/broken", ext = "isle")]
 fn broken(test_file: &str) {
-    let (_, result) = run(test_file).expect("run should complete without errors");
+    let (summary, result) = run(test_file).expect("run should complete without errors");
     result.expect_err("verification should fail");
+    // Fail by counterexample, not by an error in building the conditions.
+    assert!(
+        summary.failure > 0,
+        "expected at least one verification failure, got summary {summary:?}"
+    );
+    assert_eq!(
+        summary.expansion_errors, 0,
+        "expected no expansion errors, got summary {summary:?}"
+    );
 }
 
 /// Test files containing a term whose spec does not type check on its own.
@@ -65,5 +74,21 @@ fn spec_conflict(test_file: &str) {
     assert_eq!(
         summary.applicable, 0,
         "expected the run to fail before verification, got summary {summary:?}"
+    );
+}
+
+/// Test files whose rule has a right-hand side that is ill-typed for some type
+/// assignment accepted by the left-hand side.
+#[file_tests(path = "filetests/rhs_type_error", ext = "isle")]
+fn rhs_type_error(test_file: &str) {
+    let (summary, result) = run(test_file).expect("run should complete without errors");
+    result.expect_err("the right-hand side type error should fail the run");
+    assert!(
+        summary.expansion_errors > 0,
+        "expected the right-hand side type error to be reported, got summary {summary:?}"
+    );
+    assert_eq!(
+        summary.success, 0,
+        "expected no successful verification of an ill-typed rule, got summary {summary:?}"
     );
 }

@@ -786,20 +786,30 @@ impl GuestCall {
     /// A call will not be ready to run if either:
     ///
     /// - the (sub-)component instance to be called has already been entered and
-    /// cannot be reentered until an in-progress call completes
+    ///   cannot be reentered until an in-progress call completes, and the task
+    ///   requires the exclusive lock
     ///
     /// - the call is for a not-yet started task and the (sub-)component
-    /// instance to be called has backpressure enabled
+    ///   instance to be called has backpressure enabled
     fn is_ready(&self, store: &mut StoreOpaque) -> Result<bool> {
         let task = store.concurrent_state_mut()?.get_mut(self.thread.task)?;
         let async_typed = task.async_typed;
+        let async_lifted = task.async_lifted;
+        let has_callback = task.callback.is_some();
         let instance = task.instance;
         let state = store.instance_state(instance).concurrent_state();
 
         let ready = match &self.kind {
             GuestCallKind::DeliverEvent { .. } => !state.do_not_enter,
             GuestCallKind::StartImplicit(_) => {
-                !async_typed || !(state.do_not_enter || state.backpressure > 0)
+                if async_typed {
+                    // Sync- and callback-lifted exports need the instance's
+                    // exclusive lock to start, but stackful ones don't.
+                    let needs_exclusive = !async_lifted || has_callback;
+                    !((needs_exclusive && state.do_not_enter) || state.backpressure > 0)
+                } else {
+                    true
+                }
             }
             GuestCallKind::StartExplicit(_) => true,
         };
@@ -1423,7 +1433,7 @@ impl<T> StoreContextMut<'_, T> {
                 // unwound. Note that this is checked after polling `future`
                 // above so that it can observe the original error, e.g. a
                 // trap delivered over a oneshot channel by a work item.
-                if reset.store.0.trapped() {
+                if reset.store.0.component_trapped() {
                     return Poll::Ready(Err(Trap::CannotEnterComponent.into()));
                 }
 
@@ -1774,6 +1784,8 @@ impl<T> StoreContextMut<'_, T> {
         instance: ModuleInstance,
         callee: Option<RuntimeInstance>,
     ) -> Result<ModuleInstance> {
+        // See `Func::call_async` for why this is checked up front.
+        self.0.check_event_loop_not_running()?;
         let (tx, rx) = oneshot::channel();
         let token = StoreToken::new(self.as_context_mut());
         self.0.queue_task(move |store| {
@@ -2160,7 +2172,7 @@ impl StoreOpaque {
     }
 
     /// Same as `instance_state`, but also returns the store's `HandleCounter`
-    /// for inserting into or removing from the instance's handle tables.
+    /// for inserting into the instance's handle tables.
     fn instance_state_and_handle_counter(
         &mut self,
         instance: RuntimeInstance,
@@ -2562,10 +2574,9 @@ impl StoreOpaque {
         let thread_data = state.get_mut(guest_thread.thread)?;
         let sync_call_set = thread_data.sync_call_set;
         if let Some(guest_id) = thread_data.instance_rep {
-            let (state, counter) = self.instance_state_and_handle_counter(runtime_instance);
-            state
+            self.instance_state(runtime_instance)
                 .thread_handle_table()
-                .guest_thread_remove(counter, guest_id)?;
+                .guest_thread_remove(guest_id)?;
         }
         let state = self.concurrent_state_mut()?;
 
@@ -2631,8 +2642,13 @@ impl StoreOpaque {
 
         // Clean up the thread within this task as it's now never going
         // to run.
+        //
+        // Note that `next_switch_item`, if any, belongs to the canceller and
+        // not this thread since this thread never ran, so it's saved and
+        // restored here to prevent `cleanup_thread` from taking it.
         assert_eq!(1, task.threads.len());
         let thread = *task.threads.iter().next().unwrap();
+        let next_switch_item = concurrent_state.save_next_switch_item()?;
         self.cleanup_thread(
             QualifiedThreadId {
                 task: guest_task,
@@ -2640,6 +2656,8 @@ impl StoreOpaque {
             },
             caller_instance,
         )?;
+        self.concurrent_state_mut()?
+            .restore_next_switch_item(next_switch_item)?;
 
         // Not yet started; cancel and remove from pending
         let pending = &mut self.instance_state(instance).concurrent_state().pending;
@@ -3498,8 +3516,15 @@ impl Instance {
         let guest_thread = store.0.current_guest_thread()?;
         let state = store.0.concurrent_state_mut()?;
 
+        // FIXME(#14950): this in theory should be a `bail_bug!`, but this can
+        // be hit through `Func::call` for example. This isn't great because it
+        // means that `Func::call` is sort of fundamentally incompatible with
+        // component-model-async...
         if !state.event_loop_running {
-            bail_bug!("Instance::start_call called without a running event loop");
+            bail!(
+                "async function started during an original synchronous \
+                 entrypoint; please use an async-style entrypoint instead"
+            );
         }
 
         let callee = SendSyncPtr::new(callee);
@@ -3982,9 +4007,10 @@ impl Instance {
         caller_instance: RuntimeComponentInstanceIndex,
         set: u32,
     ) -> Result<()> {
-        let (state, counter) =
-            store.instance_state_and_handle_counter(self.runtime_instance(caller_instance));
-        let rep = state.handle_table().waitable_set_remove(counter, set)?;
+        let rep = store
+            .instance_state(self.runtime_instance(caller_instance))
+            .handle_table()
+            .waitable_set_remove(set)?;
 
         log::trace!("drop waitable set {rep} (handle {set})");
 
@@ -4045,9 +4071,10 @@ impl Instance {
     ) -> Result<()> {
         self.waitable_join(store, caller_instance, task_id, 0)?;
 
-        let (state, counter) =
-            store.instance_state_and_handle_counter(self.runtime_instance(caller_instance));
-        let (rep, is_host) = state.handle_table().subtask_remove(counter, task_id)?;
+        let (rep, is_host) = store
+            .instance_state(self.runtime_instance(caller_instance))
+            .handle_table()
+            .subtask_remove(task_id)?;
 
         let concurrent_state = store.concurrent_state_mut()?;
         let waitable = if is_host {
@@ -6788,6 +6815,9 @@ pub(crate) fn prepare_call<T, R>(
     + Sync
     + 'static,
 ) -> Result<PreparedCall<R>> {
+    // This check should be redundant, but leave it here so that there is a
+    // clear error when trying to execute wasm in a poisoned store instead of
+    // possibly hitting some other `bail_bug!` because of inconsistent state.
     if !store.0.may_enter() {
         bail!(Trap::CannotEnterComponent);
     }
