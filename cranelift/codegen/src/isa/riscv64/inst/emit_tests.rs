@@ -2338,3 +2338,243 @@ fn riscv64_worst_case_instruction_size() {
     println!("calculate max size is {} , inst is {:?}", max.0, max.1);
     assert!(max.0 <= Inst::worst_case_size());
 }
+
+#[test]
+fn riscv64_store_large_offset_scratch_selection() {
+    let (flags, isa_flags) = make_test_flags();
+    let emit_info = EmitInfo::new(flags, isa_flags);
+
+    // Case 1: Base is a normal reg (a0), Src is a normal reg (a1).
+    // Scratch selected should be spilltmp_reg() (x31 / t6).
+    {
+        let inst = Inst::Store {
+            to: AMode::RegOffset(a0(), 5000),
+            op: StoreOP::Sd,
+            flags: MemFlagsData::new(),
+            src: a1(),
+        };
+        let mut buffer = MachBuffer::new();
+        inst.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
+        assert_eq!(
+            buffer.data(),
+            &[
+                0xb7, 0x1f, 0x00, 0x00, // lui t6, 1
+                0x93, 0x8f, 0x8f, 0x38, // addi t6, t6, 0x388
+                0xb3, 0x8f, 0xaf, 0x00, // add t6, t6, a0
+                0x23, 0xb0, 0xbf, 0x00, // sd a1, 0(t6)
+            ]
+        );
+    }
+
+    // Case 2: Base is spilltmp_reg() (x31 / t6), Src is a normal reg (a1).
+    // Scratch selected must be spilltmp_reg2() (x30 / t5) to avoid clobbering base.
+    {
+        let inst = Inst::Store {
+            to: AMode::RegOffset(spilltmp_reg(), 5000),
+            op: StoreOP::Sd,
+            flags: MemFlagsData::new(),
+            src: a1(),
+        };
+        let mut buffer = MachBuffer::new();
+        inst.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
+        assert_eq!(
+            buffer.data(),
+            &[
+                0x37, 0x1f, 0x00, 0x00, // lui t5, 1
+                0x13, 0x0f, 0x8f, 0x38, // addi t5, t5, 0x388
+                0x33, 0x0f, 0xff, 0x01, // add t5, t5, t6
+                0x23, 0x30, 0xbf, 0x00, // sd a1, 0(t5)
+            ]
+        );
+    }
+
+    // Case 3: Base is normal reg (a0), Src is spilltmp_reg() (x31 / t6).
+    // Scratch selected must be spilltmp_reg2() (x30 / t5) to avoid clobbering src.
+    {
+        let inst = Inst::Store {
+            to: AMode::RegOffset(a0(), 5000),
+            op: StoreOP::Sd,
+            flags: MemFlagsData::new(),
+            src: spilltmp_reg(),
+        };
+        let mut buffer = MachBuffer::new();
+        inst.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
+        assert_eq!(
+            buffer.data(),
+            &[
+                0x37, 0x1f, 0x00, 0x00, // lui t5, 1
+                0x13, 0x0f, 0x8f, 0x38, // addi t5, t5, 0x388
+                0x33, 0x0f, 0xaf, 0x00, // add t5, t5, a0
+                0x23, 0x30, 0xff, 0x01, // sd t6, 0(t5)
+            ]
+        );
+    }
+
+    // Case 4: Base is spilltmp_reg2() (x30 / t5), Src is normal reg (a1).
+    // Scratch selected should be spilltmp_reg() (x31 / t6) to avoid clobbering base.
+    {
+        let inst = Inst::Store {
+            to: AMode::RegOffset(spilltmp_reg2(), 5000),
+            op: StoreOP::Sd,
+            flags: MemFlagsData::new(),
+            src: a1(),
+        };
+        let mut buffer = MachBuffer::new();
+        inst.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
+        assert_eq!(
+            buffer.data(),
+            &[
+                0xb7, 0x1f, 0x00, 0x00, // lui t6, 1
+                0x93, 0x8f, 0x8f, 0x38, // addi t6, t6, 0x388
+                0xb3, 0x8f, 0xef, 0x01, // add t6, t6, t5
+                0x23, 0xb0, 0xbf, 0x00, // sd a1, 0(t6)
+            ]
+        );
+    }
+
+    // Case 5: Base is normal reg (a0), Src is spilltmp_reg2() (x30 / t5).
+    // Scratch selected should be spilltmp_reg() (x31 / t6) to avoid clobbering src.
+    {
+        let inst = Inst::Store {
+            to: AMode::RegOffset(a0(), 5000),
+            op: StoreOP::Sd,
+            flags: MemFlagsData::new(),
+            src: spilltmp_reg2(),
+        };
+        let mut buffer = MachBuffer::new();
+        inst.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
+        assert_eq!(
+            buffer.data(),
+            &[
+                0xb7, 0x1f, 0x00, 0x00, // lui t6, 1
+                0x93, 0x8f, 0x8f, 0x38, // addi t6, t6, 0x388
+                0xb3, 0x8f, 0xaf, 0x00, // add t6, t6, a0
+                0x23, 0xb0, 0xef, 0x01, // sd t5, 0(t6)
+            ]
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "cannot simultaneously occupy both reserved scratch registers")]
+fn riscv64_store_large_offset_scratch_collision_assert() {
+    let (flags, isa_flags) = make_test_flags();
+    let emit_info = EmitInfo::new(flags, isa_flags);
+    let inst = Inst::Store {
+        to: AMode::RegOffset(spilltmp_reg(), 5000),
+        op: StoreOP::Sd,
+        flags: MemFlagsData::new(),
+        src: spilltmp_reg2(),
+    };
+    let mut buffer = MachBuffer::new();
+    inst.emit(&mut buffer, &emit_info, &mut Default::default());
+}
+
+#[test]
+#[should_panic(expected = "cannot simultaneously occupy both reserved scratch registers")]
+fn riscv64_store_large_offset_scratch_collision_assert_reverse() {
+    let (flags, isa_flags) = make_test_flags();
+    let emit_info = EmitInfo::new(flags, isa_flags);
+    let inst = Inst::Store {
+        to: AMode::RegOffset(spilltmp_reg2(), 5000),
+        op: StoreOP::Sd,
+        flags: MemFlagsData::new(),
+        src: spilltmp_reg(),
+    };
+    let mut buffer = MachBuffer::new();
+    inst.emit(&mut buffer, &emit_info, &mut Default::default());
+}
+
+#[test]
+fn riscv64_load_addr_large_offset_aliasing() {
+    let (flags, isa_flags) = make_test_flags();
+    let emit_info = EmitInfo::new(flags, isa_flags);
+
+    // Case 1: rd == rs with a normal register (a0).
+    // Temporary must NOT be a0 (which would clobber the base address before the add).
+    // Scratch selected must be spilltmp_reg() (t6 / x31).
+    {
+        let inst = Inst::LoadAddr {
+            rd: writable_a0(),
+            mem: AMode::RegOffset(a0(), 5000),
+        };
+        let mut buffer = MachBuffer::new();
+        inst.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
+        assert_eq!(
+            buffer.data(),
+            &[
+                0xb7, 0x1f, 0x00, 0x00, // lui t6, 1
+                0x93, 0x8f, 0x8f, 0x38, // addi t6, t6, 0x388
+                0x33, 0x85, 0xaf, 0x00, // add a0, t6, a0
+            ]
+        );
+    }
+
+    // Case 2: rd == rs == spilltmp_reg() (t6 / x31).
+    // Temporary must NOT be t6 (which would clobber the base address before the add).
+    // Scratch selected must be spilltmp_reg2() (t5 / x30).
+    {
+        let inst = Inst::LoadAddr {
+            rd: writable_spilltmp_reg(),
+            mem: AMode::RegOffset(spilltmp_reg(), 5000),
+        };
+        let mut buffer = MachBuffer::new();
+        inst.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
+        assert_eq!(
+            buffer.data(),
+            &[
+                0x37, 0x1f, 0x00, 0x00, // lui t5, 1
+                0x13, 0x0f, 0x8f, 0x38, // addi t5, t5, 0x388
+                0xb3, 0x0f, 0xff, 0x01, // add t6, t5, t6
+            ]
+        );
+    }
+
+    // Case 3: rd == rs == spilltmp_reg2() (t5 / x30).
+    // Temporary must NOT be t5 (which would clobber the base address before the add).
+    // Scratch selected must be spilltmp_reg() (t6 / x31).
+    {
+        let inst = Inst::LoadAddr {
+            rd: writable_spilltmp_reg2(),
+            mem: AMode::RegOffset(spilltmp_reg2(), 5000),
+        };
+        let mut buffer = MachBuffer::new();
+        inst.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
+        assert_eq!(
+            buffer.data(),
+            &[
+                0xb7, 0x1f, 0x00, 0x00, // lui t6, 1
+                0x93, 0x8f, 0x8f, 0x38, // addi t6, t6, 0x388
+                0x33, 0x8f, 0xef, 0x01, // add t5, t6, t5
+            ]
+        );
+    }
+
+    // Case 4: rd != rs (rd: a1, rs: a0).
+    // No aliasing collision: rd can safely be used directly to materialize the constant.
+    {
+        let inst = Inst::LoadAddr {
+            rd: writable_a1(),
+            mem: AMode::RegOffset(a0(), 5000),
+        };
+        let mut buffer = MachBuffer::new();
+        inst.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
+        assert_eq!(
+            buffer.data(),
+            &[
+                0xb7, 0x15, 0x00, 0x00, // lui a1, 1
+                0x93, 0x85, 0x85, 0x38, // addi a1, a1, 0x388
+                0xb3, 0x85, 0xa5, 0x00, // add a1, a1, a0
+            ]
+        );
+    }
+}

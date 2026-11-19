@@ -664,6 +664,10 @@ pub(crate) fn emit(
 
             // SIGSEGV reports the PC of the faulting load, so the stack map
             // is associated with the load itself.
+            // The stack map (if any) is associated with the address of the
+            // load itself, not the following instruction: a signal handler
+            // that observes the fault resumes by re-executing the load, so
+            // that is the PC at which the suspended frame is inspected.
             if let Some(stack_map) = stack_map {
                 sink.push_user_stack_map(state, sink.cur_offset(), stack_map);
             }

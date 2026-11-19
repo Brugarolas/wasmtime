@@ -105,9 +105,8 @@ block0:
 
 ; function %cprop_urem() -> i32 fast {
 ; block0:
-;     v33 = iconst.i32 6
-;     v2 -> v33
-;     return v33  ; v33 = 6
+;     v3 = iconst.i32 6
+;     return v3  ; v3 = 6
 ; }
 
 function %cprop_sdiv() -> i32 {
@@ -149,12 +148,11 @@ block0:
     return v2
 }
 
-;function %cprop_srem_i8_min() -> i8 fast {
-;block0:
+; function %cprop_srem_i8_min() -> i8 fast {
+; block0:
 ;     v3 = iconst.i8 0
-;     v2 -> v3
 ;     return v3  ; v3 = 0
-;}
+; }
 
 function %cprop_srem_i64_min() -> i64 {
 block0:
@@ -164,12 +162,11 @@ block0:
     return v2
 }
 
-;function %cprop_srem_i64_min() -> i64 fast {
-;block0:
+; function %cprop_srem_i64_min() -> i64 fast {
+; block0:
 ;     v3 = iconst.i64 0
-;     v2 -> v3
 ;     return v3  ; v3 = 0
-;}
+; }
 
 function %cprop_srem() -> i32 {
 block0:
@@ -181,9 +178,8 @@ block0:
 
 ; function %cprop_srem() -> i32 fast {
 ; block0:
-;     v26 = iconst.i32 -3
-;     v2 -> v26
-;     return v26  ; v26 = -3
+;     v25 = iconst.i32 -3
+;     return v25  ; v25 = -3
 ; }
 
 function %udiv_by_one(i32) -> i32 {
