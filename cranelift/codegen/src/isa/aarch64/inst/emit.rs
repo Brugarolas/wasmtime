@@ -4134,6 +4134,8 @@ impl MachInstEmit for Inst {
                 // fault.
                 sink.add_trap(trap_code);
 
+                // SIGSEGV reports the PC of the faulting load, so the stack map
+                // is associated with the load itself.
                 // The stack map (if any) is associated with the address of the
                 // load itself, not the following instruction: a signal handler
                 // that observes the fault resumes by re-executing the load, so
